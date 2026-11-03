@@ -1,5 +1,281 @@
+-- ============================================================
+
+-- ============================================================
+-- OPTIMIZER — staggered startup, chunked walk, adaptive drain
+-- ============================================================
+do
+    local Lighting        = game:GetService("Lighting")
+    local Workspace       = game:GetService("Workspace")
+    local SoundService    = game:GetService("SoundService")
+    local MaterialService = game:GetService("MaterialService")
+    local PlayersSvc      = game:GetService("Players")
+    local Terrain         = Workspace:FindFirstChildOfClass("Terrain")
+
+    local fpscap     = setfpscap or set_fps_cap
+    local flagsetter = setfflag or set_fflag
+
+    -- Only the FPS cap runs sync (it's cheap)
+    pcall(function() if fpscap then fpscap(9999) end end)
+
+    -- Everything else staggered across frames
+    task.spawn(function()
+        task.wait()
+
+        pcall(function()
+            if flagsetter then
+                flagsetter("TaskSchedulerTargetFps", "9999")
+                flagsetter("DFIntTaskSchedulerTargetFps", "9999")
+                flagsetter("FFlagDisablePostFx", "True")
+                flagsetter("FIntFRMMinGrassDistance", "0")
+                flagsetter("FIntFRMMaxGrassDistance", "0")
+                flagsetter("FIntRenderShadowIntensity", "0")
+            end
+        end)
+        task.wait()
+
+        pcall(function()
+            local r = settings().Rendering
+            r.QualityLevel       = Enum.QualityLevel.Level01
+            r.EditQualityLevel   = Enum.QualityLevel.Level01
+            r.MeshCacheSize      = 0
+            r.EagerBulkExecution = false
+            r.TargetFrameRate    = 9999
+        end)
+        task.wait()
+
+        pcall(function()
+            local p = settings().Physics
+            p.PhysicsEnvironmentalThrottle = Enum.EnviromentalPhysicsThrottle.Heavy
+            p.AllowSleep          = true
+            p.ThrottleAdjustTime  = 2
+            p.AreOwnersReplicated = false
+            p.DisableCSGv2        = true
+        end)
+        task.wait()
+
+        pcall(function() settings().Network.IncomingReplicationLag = 0 end)
+        pcall(function()
+            Workspace.InterpolationThrottling  = Enum.InterpolationThrottlingMode.Enabled
+            Workspace.ClientAnimatorThrottling = Enum.ClientAnimatorThrottlingMode.Enabled
+        end)
+        task.wait()
+
+        pcall(function() MaterialService.Use2022Materials = false end)
+
+        pcall(function()
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 9e9
+            Lighting.FogStart = 9e9
+            Lighting.Brightness = 0
+            Lighting.ShadowSoftness = 0
+            Lighting.EnvironmentDiffuseScale  = 0
+            Lighting.EnvironmentSpecularScale = 0
+            Lighting.ExposureCompensation = 0
+            Lighting.ColorShift_Bottom = Color3.new(0,0,0)
+            Lighting.ColorShift_Top    = Color3.new(0,0,0)
+        end)
+        task.wait()
+
+        local function stripEffects(parent)
+            for _, c in ipairs(parent:GetDescendants()) do
+                if c:IsA("PostEffect") or c:IsA("Atmosphere") or c:IsA("Clouds") or c:IsA("Sky") then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+        end
+        pcall(stripEffects, Lighting)
+        task.wait()
+        pcall(stripEffects, Workspace.CurrentCamera)
+        task.wait()
+
+        if Terrain then
+            pcall(function()
+                Terrain.WaterWaveSize     = 0
+                Terrain.WaterWaveSpeed    = 0
+                Terrain.WaterReflectance  = 0
+                Terrain.WaterTransparency = 0
+                Terrain.Decoration        = false
+                if sethiddenproperty then
+                    sethiddenproperty(Terrain, "Decoration", false)
+                    sethiddenproperty(Terrain, "GrassLength", 0)
+                end
+            end)
+        end
+
+        pcall(function()
+            SoundService.AmbientReverb  = Enum.ReverbType.NoReverb
+            SoundService.DopplerScale   = 0
+            SoundService.RolloffScale   = 0
+        end)
+    end)
+
+    -- ==================================================
+    -- Cleanup logic (chunked, adaptive, non-blocking)
+    -- ==================================================
+    local keepMaterials = {
+        [Enum.Material.Neon]       = true,
+        [Enum.Material.Glass]      = true,
+        [Enum.Material.ForceField] = true,
+    }
+
+    local modelCharCache = setmetatable({}, {__mode = "k"})
+    local charObjCache   = setmetatable({}, {__mode = "k"})
+
+    local function isCharacter(obj)
+        local cached = charObjCache[obj]
+        if cached ~= nil then return cached end
+        local curr = obj
+        while curr and curr ~= Workspace and curr ~= game do
+            if curr:IsA("Accessory") or curr:IsA("Tool")
+               or curr:IsA("Shirt") or curr:IsA("Pants") or curr:IsA("ShirtGraphic") then
+                charObjCache[obj] = true; return true
+            end
+            if curr:IsA("Model") then
+                local isChar = modelCharCache[curr]
+                if isChar == nil then
+                    isChar = (curr:FindFirstChildOfClass("Humanoid") ~= nil)
+                          or (PlayersSvc:GetPlayerFromCharacter(curr) ~= nil)
+                    modelCharCache[curr] = isChar
+                end
+                if isChar then charObjCache[obj] = true; return true end
+            end
+            curr = curr.Parent
+        end
+        charObjCache[obj] = false
+        return false
+    end
+
+    local function cleanObject(obj)
+        if isCharacter(obj) then
+            if obj:IsA("BasePart") then
+                obj.CastShadow = false
+            elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail")
+                or obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
+            return
+        end
+
+        if obj:IsA("BasePart") then
+            if not keepMaterials[obj.Material] then
+                obj.Material = Enum.Material.SmoothPlastic
+            end
+            obj.Reflectance = 0
+            obj.CastShadow  = false
+            if obj:IsA("MeshPart") or obj:IsA("UnionOperation") then
+                pcall(function() obj.RenderFidelity = Enum.RenderFidelity.Performance end)
+                pcall(function()
+                    if sethiddenproperty then
+                        sethiddenproperty(obj, "RenderFidelity", Enum.RenderFidelity.Performance)
+                    end
+                end)
+            end
+            if obj:IsA("MeshPart") then
+                pcall(function() obj.TextureID = "" end)
+                pcall(function() obj.DoubleSided = false end)
+            end
+        elseif obj:IsA("SpecialMesh") or obj:IsA("FileMesh") then
+            pcall(function() obj.TextureId = "" end)
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            pcall(function() obj:Destroy() end)
+        elseif obj:IsA("SurfaceAppearance") or obj:IsA("MaterialVariant") then
+            pcall(function() obj:Destroy() end)
+        elseif obj:IsA("Light") then
+            obj.Shadows = false
+            obj.Enabled = false
+        elseif obj:IsA("ParticleEmitter") then
+            pcall(function() obj.Enabled = false; obj:Clear() end)
+        elseif obj:IsA("Beam") or obj:IsA("Trail") then
+            pcall(function() obj.Enabled = false end)
+        elseif obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") or obj:IsA("Highlight") then
+            pcall(function() obj.Enabled = false end)
+        elseif obj:IsA("Explosion") then
+            obj.Visible = false
+        elseif obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+            obj.LightInfluence = 0
+        elseif obj:IsA("Model") then
+            pcall(function() obj.LevelOfDetail = Enum.ModelLevelOfDetail.Disabled end)
+        end
+    end
+
+    local processed = setmetatable({}, {__mode = "k"})
+    local function safeClean(obj)
+        if processed[obj] then return end
+        processed[obj] = true
+        pcall(cleanObject, obj)
+    end
+
+    -- Chunked initial walk — no GetDescendants() call
+    task.defer(function()
+        local stack = { Workspace }
+        while #stack > 0 do
+            local t0 = os.clock()
+            while #stack > 0 and (os.clock() - t0) < 0.002 do
+                local idx = #stack
+                local obj = stack[idx]
+                stack[idx] = nil
+                if obj ~= Workspace then
+                    safeClean(obj)
+                end
+                local kids = obj:GetChildren()
+                for k = 1, #kids do
+                    stack[#stack + 1] = kids[k]
+                end
+            end
+            task.wait()
+        end
+    end)
+
+    -- Adaptive queue drain
+    local queue, draining = {}, false
+
+    local function drain()
+        if draining then return end
+        draining = true
+        task.spawn(function()
+            while #queue > 0 do
+                local n = #queue
+                local budget = n > 5000 and 0.010
+                            or n > 1000 and 0.005
+                            or 0.002
+                local t0 = os.clock()
+                while #queue > 0 and (os.clock() - t0) < budget do
+                    local idx = #queue
+                    local obj = queue[idx]
+                    queue[idx] = nil
+                    safeClean(obj)
+                end
+                task.wait()
+            end
+            draining = false
+        end)
+    end
+
+    Workspace.DescendantAdded:Connect(function(desc)
+        if processed[desc] then return end
+        queue[#queue + 1] = desc
+        drain()
+    end)
+
+    Lighting.ChildAdded:Connect(function(c)
+        if c:IsA("PostEffect") or c:IsA("Atmosphere") or c:IsA("Clouds") or c:IsA("Sky") then
+            pcall(function() c:Destroy() end)
+        end
+    end)
+
+    if Workspace.CurrentCamera then
+        Workspace.CurrentCamera.ChildAdded:Connect(function(c)
+            if c:IsA("PostEffect") then
+                pcall(function() c:Destroy() end)
+            end
+        end)
+    end
+
+    print("[Optimizer] Loaded — staggered startup, chunked walk")
+end
+-- ============================================================
+
 -- Dᴇᴏʙғᴜsᴄᴀᴛᴇᴅ ʙʏ GPT-6 Lᴜɴᴀ Mᴀx
-print('[Jen Finder] Loading...')
 local Players = game:GetService('Players')
 local RS = game:GetService('ReplicatedStorage')
 local player = Players.LocalPlayer
@@ -86,7 +362,6 @@ local function createFinder(D)
         discordBlue   = Color3.fromRGB(88, 101, 242),
     }
 
-    -- ============ BOTTOM NOTICE — CLICKABLE, COPIES DISCORD LINK ============
     local sharingNotice=D.make('TextButton',{
         Text='JEN FINDER ON • Sharing egg sightings • discord.gg/8zxVj7Ygeg',
         Position=UDim2.new(0,12,1,-28),
@@ -114,7 +389,6 @@ local function createFinder(D)
                 return
             end
         end
-        -- Fallback: show URL so user can copy manually
         sharingNotice.Text=DISCORD_LINK
         task.delay(3,function()
             if sharingNotice and sharingNotice.Parent then
@@ -258,11 +532,11 @@ local function createFinder(D)
             local ok,res=pcall(function() return game:HttpGet(url) end)
             if ok and type(res)=='string' then text=res end
         end
-        if type(text)~='string' or text=='' then warn('[Jen Finder] Background fetch failed; using solid color'); return end
+        if type(text)~='string' or text=='' then return end
         local b64=text:match('base64,(.+)') or text
         b64=b64:gsub('%s+','')
         if b64:sub(1,1)=='"' then b64=b64:sub(2,-2) end
-        if type(base64decode)~='function' or type(writefile)~='function' or type(getcustomasset)~='function' then warn('[Jen Finder] base64decode/writefile/getcustomasset unavailable; using solid color'); return end
+        if type(base64decode)~='function' or type(writefile)~='function' or type(getcustomasset)~='function' then return end
         local ok,err=pcall(function()
             writefile('jenicakes_bg.png',base64decode(b64))
             local asset=getcustomasset('jenicakes_bg.png')
@@ -275,10 +549,8 @@ local function createFinder(D)
                 bgImg.ZIndex=-2; overlay.ZIndex=-1
                 for _,c in ipairs(panel:GetChildren()) do if c~=bgImg and c~=overlay and c~=bar then c.ZIndex=2 end end
                 bar.ZIndex=3
-                print('[Jen Finder] Background loaded')
             end
         end)
-        if not ok then warn('[Jen Finder] Background apply failed:',err) end
     end)
 
     local status=D.label(panel,'Connecting…',UDim2.fromOffset(14,48),UDim2.new(1,-28,0,22),THEME.textPrimary,13)
@@ -302,7 +574,6 @@ local function createFinder(D)
     D.make('UIGradient',{Color=ColorSequence.new(THEME.btnPurple,THEME.btnPink),Rotation=0},refreshButton)
 
     local refreshing=false
-    -- List height restored (footer button removed)
     local list=D.make('ScrollingFrame',{Position=UDim2.fromOffset(8,146),Size=UDim2.new(1,-16,1,-154),BackgroundTransparency=1,AutomaticCanvasSize=Enum.AutomaticSize.None,CanvasSize=UDim2.new(),ScrollBarThickness=4,ZIndex=2},panel)
     D.make('UIListLayout',{Padding=UDim.new(0,5),SortOrder=Enum.SortOrder.LayoutOrder},list)
     local aliveMessage=D.label(list,'Waiting for participant reports',UDim2.new(),UDim2.new(1,-10,0,40),THEME.accentPink,12)
@@ -349,6 +620,7 @@ local function createFinder(D)
     end
 
     local lastRender
+    local rendering=false
     local rarityColors={ divine=Color3.fromRGB(255,205,55),eternal=Color3.fromRGB(255,160,225), secret=Color3.fromRGB(255,255,255),cosmic=Color3.fromRGB(190,85,255), mythic=Color3.fromRGB(255,75,85),legendary=Color3.fromRGB(255,155,45), epic=Color3.fromRGB(255,110,200),rare=Color3.fromRGB(65,165,255), uncommon=Color3.fromRGB(105,220,120),common=Color3.fromRGB(220,225,235) }
 
     local function mutationCaption(entry)
@@ -375,97 +647,113 @@ local function createFinder(D)
     end
 
     local function render()
-        local now=(os.clock()+clockOffset)*1000
-        local entries,parts={},{}
-        local source,seen={},{}
-        if not othersOnly then
-            for _,e in ipairs(feed) do
-                if e.jobId~=game.JobId and type(e.expiresAt)=='number' and e.expiresAt>now then source[#source+1]=e;seen[e.key]=true end
-            end
-        end
-        for _,e in ipairs(D.entries()) do
-            if (e.rate or 0)>=minRate and (e.tier or 0)>=minRank then
-                local key=game.PlaceId..':'..game.JobId..':'..tostring(e.uid or e.key)
-                if not seen[key] then
-                    seen[key]=true
-                    source[#source+1]={key=key,name=e.name,rate=e.rate or 0,missingRate=e.rate==nil,scale=e.scale,weight=e.weight,icon=e.icon,rarity=e.rarity,mutations=e.mutationText,traitsKnown=e.traitsKnown~=false,area=e.areaKey or e.area,model=e.model,isLocal=true,source=e.isEvent and 'event' or 'field',estimated=e.estimated or e.unmutatedRate~=nil,placeId=game.PlaceId,jobId=game.JobId,expiresAt=now+5000,seenAt=0}
+        if rendering then return end
+        rendering = true
+        local success, err = pcall(function()
+            if not panel.Visible then return end
+
+            local now=(os.clock()+clockOffset)*1000
+            local entries,parts={},{}
+            local source,seen={},{}
+            if not othersOnly then
+                for _,e in ipairs(feed) do
+                    if e.jobId~=game.JobId and type(e.expiresAt)=='number' and e.expiresAt>now then source[#source+1]=e;seen[e.key]=true end
                 end
             end
-        end
-        table.sort(source,function(a,b) if a.rate~=b.rate then return a.rate>b.rate end; return a.key<b.key end)
-        if not othersOnly then
-            local limit=50
-            while #source>limit do source[#source]=nil end
-        end
-        for i,e in ipairs(source) do e.displayRank=i end
-        for _,entry in ipairs(source) do
-            if type(entry)=='table' and type(entry.expiresAt)=='number' and now<entry.expiresAt and type(entry.rate)=='number' and type(entry.jobId)=='string' then
-                entries[#entries+1]=entry
-                parts[#parts+1]=table.concat({entry.key,tostring(entry.seenAt),tostring(entry.rate),tostring(entry.scale),tostring(entry.name),tostring(entry.area),tostring(entry.rarity),tostring(entry.mutations),tostring(entry.traitsKnown)},':')
-            end
-        end
-        local signature=tostring(othersOnly)..table.concat(parts,'|')
-        if signature==lastRender then return end
-        lastRender=signature
-        local savedScroll=list.CanvasPosition
-        local canvasHeight=#entries==0 and 40 or 0
-        for _,child in ipairs(list:GetChildren()) do if child:IsA('Frame') then child:Destroy() end end
-        aliveMessage.Visible=#entries==0
-        aliveMessage.Text=othersOnly and 'No matching eggs in this server' or 'No matching eggs right now'
-        for i,entry in ipairs(entries) do
-            local row=D.make('Frame',{Size=UDim2.new(1,-6,0,90),LayoutOrder=i,BackgroundColor3=THEME.rowBg,BackgroundTransparency=0.15},list)
-            D.make('UICorner',{CornerRadius=UDim.new(0,6)},row)
-            D.make('UIStroke',{Color=THEME.rowStroke,Thickness=1},row)
-            D.make('ImageLabel',{Image=entry.icon or '',BackgroundTransparency=1,Size=UDim2.fromOffset(60,70),Position=UDim2.fromOffset(4,8),ScaleType=Enum.ScaleType.Fit},row)
-            local rarityKey=tostring(entry.rarity):lower():gsub('%s+','')
-            local nameColor=rarityColors[rarityKey] or Color3.fromRGB(240,220,250)
-            local nameLabel=D.label(row,tostring(entry.displayRank or entry.globalRank or i)..'. '..tostring(entry.name),UDim2.fromOffset(74,5),UDim2.new(1,-80,0,26),rarityKey=='eternal' and Color3.new(1,1,1) or nameColor,18)
-            if rarityKey=='eternal' then D.make('UIGradient',{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(255,120,210)),ColorSequenceKeypoint.new(0.5,Color3.fromRGB(245,215,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(200,125,255))}),Rotation=0},nameLabel) end
-            D.label(row,entry.missingRate and 'Income unavailable' or (entry.estimated and '~ ' or '')..D.money(entry.rate),UDim2.fromOffset(74,33),UDim2.new(1,-170,0,23),THEME.moneyGreen,15)
-            local details=entry.scale and string.format('×%.2f',entry.scale) or 'Size ?'
-            details=details..' | '..tostring(entry.rarity)..(entry.isLocal and '' or (' | '..math.max(0,math.floor((now-entry.seenAt)/1000))..'s'))
-            D.label(row,details,UDim2.fromOffset(74,59),UDim2.new(1,-170,0,21),nameColor,13)
-            local mutationText=mutationCaption(entry)
-            if mutationText then
-                local height=22
-                pcall(function() height=math.max(22,game:GetService('TextService'):GetTextSize(mutationText,13,Enum.Font.GothamBold,Vector2.new(math.max(140,panel.AbsoluteSize.X-100),1000)).Y) end)
-                row.Size=UDim2.new(1,-6,0,89+height)
-                local mutationLabel=D.label(row,mutationText,UDim2.fromOffset(74,83),UDim2.new(1,-84,0,height),THEME.accentPink,13)
-                mutationLabel.TextWrapped=true
-                local badges={}
-                for _,name in ipairs({'Silver','Golden','Rainbow'}) do if mutationText:lower():find(name:lower(),1,true) then badges[#badges+1]=name end end
-                for index,name in ipairs(badges) do
-                    local badge=D.label(row,name,UDim2.fromOffset(1,68-(#badges-index)*16),UDim2.fromOffset(68,20),Color3.new(1,1,1),13)
-                    badge.TextXAlignment=Enum.TextXAlignment.Center
-                    mutationStyle(badge,name)
+            for _,e in ipairs(D.entries()) do
+                if (e.rate or 0)>=minRate and (e.tier or 0)>=minRank then
+                    local key=game.PlaceId..':'..game.JobId..':'..tostring(e.uid or e.key)
+                    if not seen[key] then
+                        seen[key]=true
+                        source[#source+1]={key=key,name=e.name,rate=e.rate or 0,missingRate=e.rate==nil,scale=e.scale,weight=e.weight,icon=e.icon,rarity=e.rarity,mutations=e.mutationText,traitsKnown=e.traitsKnown~=false,area=e.areaKey or e.area,model=e.model,isLocal=true,source=e.isEvent and 'event' or 'field',estimated=e.estimated or e.unmutatedRate~=nil,placeId=game.PlaceId,jobId=game.JobId,expiresAt=now+5000,seenAt=0}
+                    end
                 end
-                local value=mutationText:match('^Mutation: (.+)$')
-                if value then mutationStyle(mutationLabel,value) end
             end
-            local here=entry.isLocal or entry.jobId==game.JobId
-            local join=D.make('TextButton',{Text=here and 'HERE' or 'JOIN',Position=UDim2.new(1,-92,0,33),Size=UDim2.fromOffset(82,42),BackgroundColor3=here and THEME.btnPurple or THEME.btnPink,TextColor3=Color3.new(1,1,1),TextSize=12},row)
-            D.make('UIStroke',{Color=THEME.accentPink,Thickness=1},join)
-            join.Activated:Connect(function()
-                if joining or entry.jobId==game.JobId then return end
-                if (os.clock()+clockOffset)*1000>=entry.expiresAt then queryStatus='Report expired; refreshing'; feedAt=0; return end
-                joining=true; queryStatus='Joining '..entry.name
-                if not config then joining=false;queryStatus='Finder not connected';return end
-                local claim,claimError=network(config.endpoint..'/v1/join','POST',Http:JSONEncode({placeId=entry.placeId,jobId=entry.jobId,uid=entry.uid,reporterId=reporterId}),headers())
-                if not claim or claim.allowed~=true then
-                    joining=false;feedAt=-math.huge
-                    if claim then for index=#feed,1,-1 do if feed[index].jobId==entry.jobId then table.remove(feed,index) end end end
-                    queryStatus=claim and 'Server reserved; choose another' or ('Join reservation failed: '..tostring(claimError))
-                    return
+            table.sort(source,function(a,b) if a.rate~=b.rate then return a.rate>b.rate end; return a.key<b.key end)
+            if not othersOnly then
+                local limit=50
+                while #source>limit do source[#source]=nil end
+            end
+            for i,e in ipairs(source) do e.displayRank=i end
+            for _,entry in ipairs(source) do
+                if type(entry)=='table' and type(entry.expiresAt)=='number' and now<entry.expiresAt and type(entry.rate)=='number' and type(entry.jobId)=='string' then
+                    entries[#entries+1]=entry
+                    parts[#parts+1]=table.concat({entry.key,tostring(entry.seenAt),tostring(entry.rate),tostring(entry.scale),tostring(entry.name),tostring(entry.area),tostring(entry.rarity),tostring(entry.mutations),tostring(entry.traitsKnown)},':')
                 end
-                D.stopFarm()
-                local ok,err=pcall(function() Teleports:TeleportToPlaceInstance(entry.placeId,entry.jobId,D.player) end)
-                if not ok then queryStatus='Join failed: '..tostring(err); joining=false end
-                task.delay(12,function() joining=false end)
-            end)
-            canvasHeight+=row.Size.Y.Offset+5
-        end
-        list.CanvasSize=UDim2.fromOffset(0,canvasHeight)
-        list.CanvasPosition=savedScroll
+            end
+            local signature=tostring(othersOnly)..table.concat(parts,'|')
+            if signature==lastRender then return end
+            lastRender=signature
+            local savedScroll=list.CanvasPosition
+            local canvasHeight=#entries==0 and 40 or 0
+            for _,child in ipairs(list:GetChildren()) do if child:IsA('Frame') then child:Destroy() end end
+            aliveMessage.Visible=#entries==0
+            aliveMessage.Text=othersOnly and 'No matching eggs in this server' or 'No matching eggs right now'
+
+            -- Chunked row creation: ~4 ms/frame budget
+            local budgetStart = os.clock()
+            for i,entry in ipairs(entries) do
+                local row=D.make('Frame',{Size=UDim2.new(1,-6,0,90),LayoutOrder=i,BackgroundColor3=THEME.rowBg,BackgroundTransparency=0.15},list)
+                D.make('UICorner',{CornerRadius=UDim.new(0,6)},row)
+                D.make('UIStroke',{Color=THEME.rowStroke,Thickness=1},row)
+                D.make('ImageLabel',{Image=entry.icon or '',BackgroundTransparency=1,Size=UDim2.fromOffset(60,70),Position=UDim2.fromOffset(4,8),ScaleType=Enum.ScaleType.Fit},row)
+                local rarityKey=tostring(entry.rarity):lower():gsub('%s+','')
+                local nameColor=rarityColors[rarityKey] or Color3.fromRGB(240,220,250)
+                local nameLabel=D.label(row,tostring(entry.displayRank or entry.globalRank or i)..'. '..tostring(entry.name),UDim2.fromOffset(74,5),UDim2.new(1,-80,0,26),rarityKey=='eternal' and Color3.new(1,1,1) or nameColor,18)
+                if rarityKey=='eternal' then D.make('UIGradient',{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(255,120,210)),ColorSequenceKeypoint.new(0.5,Color3.fromRGB(245,215,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(200,125,255))}),Rotation=0},nameLabel) end
+                D.label(row,entry.missingRate and 'Income unavailable' or (entry.estimated and '~ ' or '')..D.money(entry.rate),UDim2.fromOffset(74,33),UDim2.new(1,-170,0,23),THEME.moneyGreen,15)
+                local details=entry.scale and string.format('×%.2f',entry.scale) or 'Size ?'
+                details=details..' | '..tostring(entry.rarity)..(entry.isLocal and '' or (' | '..math.max(0,math.floor((now-entry.seenAt)/1000))..'s'))
+                D.label(row,details,UDim2.fromOffset(74,59),UDim2.new(1,-170,0,21),nameColor,13)
+                local mutationText=mutationCaption(entry)
+                if mutationText then
+                    local height=22
+                    pcall(function() height=math.max(22,game:GetService('TextService'):GetTextSize(mutationText,13,Enum.Font.GothamBold,Vector2.new(math.max(140,panel.AbsoluteSize.X-100),1000)).Y) end)
+                    row.Size=UDim2.new(1,-6,0,89+height)
+                    local mutationLabel=D.label(row,mutationText,UDim2.fromOffset(74,83),UDim2.new(1,-84,0,height),THEME.accentPink,13)
+                    mutationLabel.TextWrapped=true
+                    local badges={}
+                    for _,name in ipairs({'Silver','Golden','Rainbow'}) do if mutationText:lower():find(name:lower(),1,true) then badges[#badges+1]=name end end
+                    for index,name in ipairs(badges) do
+                        local badge=D.label(row,name,UDim2.fromOffset(1,68-(#badges-index)*16),UDim2.fromOffset(68,20),Color3.new(1,1,1),13)
+                        badge.TextXAlignment=Enum.TextXAlignment.Center
+                        mutationStyle(badge,name)
+                    end
+                    local value=mutationText:match('^Mutation: (.+)$')
+                    if value then mutationStyle(mutationLabel,value) end
+                end
+                local here=entry.isLocal or entry.jobId==game.JobId
+                local join=D.make('TextButton',{Text=here and 'HERE' or 'JOIN',Position=UDim2.new(1,-92,0,33),Size=UDim2.fromOffset(82,42),BackgroundColor3=here and THEME.btnPurple or THEME.btnPink,TextColor3=Color3.new(1,1,1),TextSize=12},row)
+                D.make('UIStroke',{Color=THEME.accentPink,Thickness=1},join)
+                join.Activated:Connect(function()
+                    if joining or entry.jobId==game.JobId then return end
+                    if (os.clock()+clockOffset)*1000>=entry.expiresAt then queryStatus='Report expired; refreshing'; feedAt=0; return end
+                    joining=true; queryStatus='Joining '..entry.name
+                    if not config then joining=false;queryStatus='Finder not connected';return end
+                    local claim,claimError=network(config.endpoint..'/v1/join','POST',Http:JSONEncode({placeId=entry.placeId,jobId=entry.jobId,uid=entry.uid,reporterId=reporterId}),headers())
+                    if not claim or claim.allowed~=true then
+                        joining=false;feedAt=-math.huge
+                        if claim then for index=#feed,1,-1 do if feed[index].jobId==entry.jobId then table.remove(feed,index) end end end
+                        queryStatus=claim and 'Server reserved; choose another' or ('Join reservation failed: '..tostring(claimError))
+                        return
+                    end
+                    D.stopFarm()
+                    local ok,err=pcall(function() Teleports:TeleportToPlaceInstance(entry.placeId,entry.jobId,D.player) end)
+                    if not ok then queryStatus='Join failed: '..tostring(err); joining=false end
+                    task.delay(12,function() joining=false end)
+                end)
+                canvasHeight+=row.Size.Y.Offset+5
+
+                if os.clock() - budgetStart > 0.004 then
+                    task.wait()
+                    budgetStart = os.clock()
+                end
+            end
+            list.CanvasSize=UDim2.fromOffset(0,canvasHeight)
+            list.CanvasPosition=savedScroll
+        end)
+        rendering = false
+        if not success then error(err) end
     end
 
     refreshButton.Activated:Connect(function()
@@ -514,7 +802,6 @@ local function createFinder(D)
             task.wait(1)
         end
     end)
-    print('[Jen Finder] Panel created')
 end
 
 local function run()
@@ -532,6 +819,10 @@ local function run()
     local function parseValue(text) local amount,suffix=tostring(text):gsub(',',''):match('^%s*%$?%s*(%d+%.?%d*)%s*(%a*)%s*$') local powers={['']=1,k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15,qi=1e18} local factor=suffix and powers[suffix:lower()] if not amount or not factor then return nil end local value=tonumber(amount)*factor return valid(value) and value or nil end
     local lastScan=0
     createFinder({gui=gui,localPanel={Visible=false},player=player,make=make,label=label,entries=function() return os.clock()-lastScan<10 and latestEntries or {} end,parseValue=parseValue,money=money,stopFarm=function() end})
+
+    -- Wait for UI + optimizer to settle before heavy scanning
+    task.wait(2)
+
     local notified={}
     local exported={}
     for _,path in ipairs({'Shared.Types.HalloweenDimension','Shared.Util.HalloweenDimension','Controllers.Game.HalloweenDimensionController'}) do local ok,value=pcall(module,path) if ok and type(value)=='table' then exported[#exported+1]=value end end
