@@ -1,4 +1,4 @@
--- Jen Finder — Full Working Finder on the Jen UI (fixed scope)
+-- Jen Finder — Full Working Finder (Auto-Join Fixed + Top 5 Fallback)
 local Players = game:GetService('Players')
 local RS = game:GetService('ReplicatedStorage')
 local player = Players.LocalPlayer
@@ -86,7 +86,19 @@ local reporterId = Http:GenerateGUID(false)
 local networkBusy = false
 local latestEntries = {}
 local lastJoinErrorMsg, lastJoinErrorAt = nil, 0
+local currentTopEntries = {} -- Stores the Top 5 for Auto-Join
 D.entries = function() return latestEntries end
+
+-- FORWARD DECLARATIONS (Fixes scoping/nil errors)
+local cardsByKey = {}
+local rendering, renderPending, renderQueued = false, false, false
+local render
+
+local function queueRender()
+  if renderQueued or not active then return end
+  renderQueued = true
+  task.defer(function() renderQueued = false; if active then render() end end)
+end
 
 local settingsPath = 'jen_finder_ui.json'
 local settings = {}
@@ -979,7 +991,6 @@ local function updateCard(card, entry, i)
 end
 
 -- ============ NETWORKING & CONFIGURATION ============
--- Moved above renderer so Join handler can access them
 local function network(url, method, body, hdrs, raw)
   if type(requestFn) ~= 'function' then return nil, 'Executor HTTP unavailable' end
   local waitDeadline = os.clock() + 15
@@ -1064,19 +1075,112 @@ local function refresh()
   clockOffset = (tonumber(data.serverTime) or os.time()*1000)/1000 - os.clock()
   feed = data.items
   feedAt = os.clock()
-  queryStatus = string.format('Updated | %d servers | %d reporters', data.servers or 0, data.participants or 0)
+  queryStatus = string.format('Updated | %d servers | %d participants', data.servers or 0, data.participants or 0)
   return true
 end
--- ============ END NETWORKING ============
 
-local cardsByKey = {}
-local rendering, renderPending, renderQueued = false, false, false
-local function queueRender()
-  if renderQueued or not active then return end
-  renderQueued = true
-  task.defer(function() renderQueued = false; if active then render() end end)
+-- Extracted Join Logic
+local function executeJoin(entry, card)
+  if joining or not entry or entry.jobId == game.JobId then return end
+  local placeId = tonumber(entry.placeId)
+  local jobId = entry.jobId
+  if not placeId or type(jobId) ~= 'string' or jobId == '' then return end
+  if (os.clock() + clockOffset) * 1000 >= (entry.expiresAt or 0) then return end
+
+  joining = true
+  joiningKey = entry.key
+  if card then updateCard(card, entry, card.row.LayoutOrder or 1) end
+
+  task.spawn(function()
+    local ok, err = pcall(function()
+      if not config then loadConfig() end
+      if config and config.endpoint then
+        local claim, claimErr = network(config.endpoint..'/v1/join', 'POST',
+          Http:JSONEncode({placeId=placeId, jobId=jobId, uid=entry.uid, reporterId=reporterId, userId=D.player.UserId}),
+          headers()
+        )
+        if claim and claim.allowed ~= true and (claim.unavailable or claim.full) then
+          entry.full = true
+          entry.unavailable = claim.unavailable == true
+          entry.takenConfirmed = claim.takenConfirmed == true
+          if card then pcall(function() updateCard(card, entry, card.row.LayoutOrder or 1) end) end
+          error('Egg no longer available')
+        end
+      end
+      if config then pcall(report) end
+      print('[Jen Join] Teleporting to', placeId, jobId)
+      Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
+    end)
+    if not ok then
+      joining = false; joiningKey = nil
+      lastJoinErrorMsg = 'Join failed: '..tostring(err)
+      lastJoinErrorAt = os.clock()
+      if card then pcall(function() updateCard(card, entry, card.row.LayoutOrder or 1) end) end
+    end
+  end)
+
+  task.delay(12, function()
+    if joining and joiningKey == entry.key then
+      joining = false; joiningKey = nil
+    end
+  end)
 end
-local render
+
+-- Spam Join logic (Top 3 cycle, 10-second window)
+local function startSpamJoin()
+  print('[Jen Auto-Join] Triggered. Refreshing feed...')
+  pcall(function()
+    if config then refresh() end
+  end)
+  render()
+
+  local waitStart = os.clock()
+  -- Wait for at least one remote entry to appear
+  while active and (#currentTopEntries == 0 or currentTopEntries[1].jobId == game.JobId) do
+    if os.clock() - waitStart > 10 then
+      print('[Jen Auto-Join] Timed out waiting for remote targets.')
+      return
+    end
+    task.wait(0.5)
+  end
+
+  local startTime = os.clock()
+  local DURATION = 10
+  local clickIndex = 1
+  local attempts = 0
+
+  task.spawn(function()
+    while active and (os.clock() - startTime) < DURATION do
+      local maxEntries = math.min(3, #currentTopEntries)   -- only Top 3
+      if maxEntries == 0 then
+        task.wait(0.3)
+      else
+        -- Wait for any in-progress join to resolve before next click
+        local joinStart = os.clock()
+        while joining and active and (os.clock() - joinStart) < 3
+              and (os.clock() - startTime) < DURATION do
+          task.wait(0.15)
+        end
+
+        if not active or (os.clock() - startTime) >= DURATION then break end
+
+        if clickIndex > maxEntries then clickIndex = 1 end
+        local target = currentTopEntries[clickIndex]
+        if target and target.jobId ~= game.JobId and target.placeId then
+          print('[Jen Auto-Join] Click #'..clickIndex..': '..tostring(target.name))
+          local card = cardsByKey[target.key]
+          executeJoin(target, card)
+          attempts = attempts + 1
+        end
+        clickIndex = clickIndex + 1
+        if clickIndex > maxEntries then clickIndex = 1 end
+        task.wait(0.8)
+      end
+    end
+    print('[Jen Auto-Join] 10s window ended. Attempts: '..attempts)
+  end)
+end
+-- ============ END NETWORKING ============
 
 local function renderOnce()
   local passEpoch = queryEpoch
@@ -1130,6 +1234,12 @@ local function renderOnce()
   local limit = PREMIUM_EDITION and 10 or 30
   while #source > limit do source[#source] = nil end
   for i, e in ipairs(source) do e.displayRank = i end
+
+  -- Update Top 5 for Auto-Join
+  currentTopEntries = {}
+  for i = 1, math.min(5, #source) do
+    currentTopEntries[i] = source[i]
+  end
 
   local savedScroll = list.CanvasPosition
   local canvasHeight = #source == 0 and 40 or 0
@@ -1288,76 +1398,8 @@ local function renderOnce()
       join.AutoButtonColor = not (entry.full or entry.unavailable)
       join.Selectable = not (entry.full or entry.unavailable)
 
-      -- ============ JOIN HANDLER (FIXED) ============
       join.Activated:Connect(function()
-        local cur = card.entry
-        if not cur then return end
-        if joining then return end
-        if cur.jobId == game.JobId then return end
-
-        local placeId = tonumber(cur.placeId)
-        local jobId = cur.jobId
-        print('[Jen Join] Clicked:', tostring(cur.name), '| placeId:', tostring(placeId), '| jobId:', tostring(jobId))
-
-        if not placeId or type(jobId) ~= 'string' or jobId == '' then
-          lastJoinErrorMsg = 'Invalid entry (no placeId/jobId)'
-          lastJoinErrorAt = os.clock()
-          print('[Jen Join] Abort: invalid IDs')
-          return
-        end
-
-        if (os.clock() + clockOffset) * 1000 >= (cur.expiresAt or 0) then
-          lastJoinErrorMsg = 'Report expired; refreshing'
-          lastJoinErrorAt = os.clock()
-          feedAt = -math.huge
-          return
-        end
-
-        joining = true; joiningKey = cur.key
-        updateCard(card, cur, card.row.LayoutOrder or 1)
-
-        task.spawn(function()
-          local ok, err = pcall(function()
-            if not config then
-              local loaded, msg = loadConfig()
-              print('[Jen Join] Config load:', tostring(loaded), tostring(msg))
-            end
-
-            if config and config.endpoint then
-              local claim, claimErr = network(
-                config.endpoint..'/v1/join', 'POST',
-                Http:JSONEncode({placeId=placeId, jobId=jobId, uid=cur.uid, reporterId=reporterId, userId=D.player.UserId}),
-                headers()
-              )
-              print('[Jen Join] Claim:', tostring(claim and claim.allowed), tostring(claimErr))
-              if claim and claim.allowed ~= true and (claim.unavailable or claim.full) then
-                cur.full = true; cur.unavailable = claim.unavailable == true; cur.takenConfirmed = claim.takenConfirmed == true
-                pcall(function() updateCard(card, cur, card.row.LayoutOrder or 1) end)
-                error('Egg no longer available ('..tostring(claim.error or 'reserved')..')')
-              end
-            end
-
-            if config then pcall(function() report() end) end
-
-            print('[Jen Join] Teleporting to', placeId, jobId)
-            Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
-          end)
-
-          if not ok then
-            joining = false; joiningKey = nil
-            lastJoinErrorMsg = 'Join failed: '..tostring(err)
-            lastJoinErrorAt = os.clock()
-            print('[Jen Join] Error:', tostring(err))
-            pcall(function() updateCard(card, cur, card.row.LayoutOrder or 1) end)
-          end
-        end)
-
-        task.delay(12, function()
-          if joining and joiningKey == cur.key then
-            joining = false; joiningKey = nil
-            print('[Jen Join] Timeout')
-          end
-        end)
+        executeJoin(card.entry, card)
       end)
     end
     card.entry = entry
@@ -1780,10 +1822,26 @@ fitFinder()
 panel.Visible = true
 render()
 
+-- Main loop + Auto-Join logic (Wait 5s, then spam join top 5)
 task.spawn(function()
+  local lastReset = nil
   while active do
     local cycle = cycleInfo()
     if cycle then
+      if lastReset == nil then
+        lastReset = cycle.resetAt
+      elseif lastReset ~= cycle.resetAt then
+        lastReset = cycle.resetAt
+        feedAt = -math.huge
+        print('[Jen Auto-Join] Reset detected! Waiting 5 seconds...')
+        task.spawn(function()
+          task.wait(5)
+          if active then
+            startSpamJoin()
+          end
+        end)
+      end
+
       local seconds = math.max(0, math.ceil(cycle.remaining))
       resetTimer.Text = cycle.running and string.format('RESET %02d:%02d', math.floor(seconds/60), seconds%60) or 'RESET PAUSED'
       resetTimer.TextColor3 = cycle.running and seconds <= 60 and Color3.fromRGB(255,85,85)
