@@ -74,6 +74,7 @@ local Http = game:GetService('HttpService')
 
 local active = true
 local othersOnly = false
+local autoJoinEnabled = true -- ADDED
 local queryEpoch = 0
 local config, configAt = nil, -math.huge
 local feed, feedAt = {}, 0
@@ -109,6 +110,7 @@ if type(readfile) == 'function' then
   end)
 end
 if type(settings.myServer) == 'boolean' then othersOnly = settings.myServer end
+if type(settings.autoJoinEnabled) == 'boolean' then autoJoinEnabled = settings.autoJoinEnabled end -- ADDED
 if type(settings.minRank) == 'number' then
   local saved = math.floor(settings.minRank)
   if saved >= 6 and saved <= 10 then minRank = saved
@@ -273,6 +275,7 @@ local function saveSettings()
     local function coords(p) return {p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset} end
     writefile(settingsPath, Http:JSONEncode({
       myServer=othersOnly, minRank=minRank, rarityMenu='mythic-up-v1',
+      autoJoinEnabled=autoJoinEnabled, -- ADDED
       menuHotkey=(settings.menuHotkey or 'F'), hotkeyDefaultVersion=2,
       sizeFactor=sizeFactor, panel=coords(panel.Position), icon=coords(open.Position)
     }))
@@ -460,6 +463,16 @@ local unlock = D.make('TextButton', {Text='PREMIUM', Position=UDim2.new(0.60,5,1
   Size=UDim2.new(0.40,-15,0,36), BackgroundColor3=Color3.fromRGB(210,170,35), TextColor3=Color3.new(1,1,1), TextSize=12}, panel)
 access.Visible = PREMIUM_EDITION and AUTO_KEY == ''
 
+-- ADDED AUTO JOIN BUTTON
+local autoJoinBtn = D.make('TextButton', {Text='AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF'), Position=UDim2.new(0,10,1,-44),
+  Size=UDim2.new(1,-20,0,34), BackgroundColor3=autoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50), TextColor3=Color3.new(1,1,1), TextSize=12}, panel)
+autoJoinBtn.Activated:Connect(function()
+  autoJoinEnabled = not autoJoinEnabled
+  autoJoinBtn.Text = 'AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF')
+  autoJoinBtn.BackgroundColor3 = autoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50)
+  saveSettings()
+end)
+
 local themeModal, loadUiAsset, syncCloseArt
 
 local refreshButton = D.make('TextButton', {Text='REFRESH', Position=UDim2.fromOffset(10,54),
@@ -547,8 +560,8 @@ task.spawn(function()
   end)
 end)
 
-for _, button in ipairs({scope, myScope, rarity, unlock, refreshButton, sizeMinus, sizePlus}) do styleRaisedButton(button) end
-for _, button in ipairs({scope, myScope, rarity, unlock}) do
+for _, button in ipairs({scope, myScope, rarity, unlock, refreshButton, sizeMinus, sizePlus, autoJoinBtn}) do styleRaisedButton(button) end
+for _, button in ipairs({scope, myScope, rarity, unlock, autoJoinBtn}) do
   button.Font = Enum.Font.FredokaOne
   local caption = button:FindFirstChild('RaisedCaption')
   if caption then
@@ -1836,7 +1849,7 @@ task.spawn(function()
         print('[Jen Auto-Join] Reset detected! Waiting 5 seconds...')
         task.spawn(function()
           task.wait(5)
-          if active then
+          if active and autoJoinEnabled then -- ADDED CHECK
             startSpamJoin()
           end
         end)
