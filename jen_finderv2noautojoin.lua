@@ -1,4 +1,4 @@
--- Jen Finder — Full Working Finder on the Jen UI (fixed scope)
+-- Jen Finder — Full Working Finder (Auto-Join Fixed + Top 5 Fallback + Auto-Join-By-Value)
 local Players = game:GetService('Players')
 local RS = game:GetService('ReplicatedStorage')
 local player = Players.LocalPlayer
@@ -74,6 +74,11 @@ local Http = game:GetService('HttpService')
 
 local active = true
 local othersOnly = false
+local autoJoinEnabled = true
+local autoJoinValueEnabled = false
+local autoJoinValueMin = 1e12
+local valueJoinAttempts = {}
+local lastValueJoinAt = 0
 local queryEpoch = 0
 local config, configAt = nil, -math.huge
 local feed, feedAt = {}, 0
@@ -86,7 +91,18 @@ local reporterId = Http:GenerateGUID(false)
 local networkBusy = false
 local latestEntries = {}
 local lastJoinErrorMsg, lastJoinErrorAt = nil, 0
+local currentTopEntries = {}
 D.entries = function() return latestEntries end
+
+local cardsByKey = {}
+local rendering, renderPending, renderQueued = false, false, false
+local render
+
+local function queueRender()
+  if renderQueued or not active then return end
+  renderQueued = true
+  task.defer(function() renderQueued = false; if active then render() end end)
+end
 
 local settingsPath = 'jen_finder_ui.json'
 local settings = {}
@@ -97,10 +113,34 @@ if type(readfile) == 'function' then
   end)
 end
 if type(settings.myServer) == 'boolean' then othersOnly = settings.myServer end
+if type(settings.autoJoinEnabled) == 'boolean' then autoJoinEnabled = settings.autoJoinEnabled end
+if type(settings.autoJoinValueEnabled) == 'boolean' then autoJoinValueEnabled = settings.autoJoinValueEnabled end
+if type(settings.autoJoinValueMin) == 'number' and settings.autoJoinValueMin > 0 then autoJoinValueMin = settings.autoJoinValueMin end
 if type(settings.minRank) == 'number' then
   local saved = math.floor(settings.minRank)
   if saved >= 6 and saved <= 10 then minRank = saved
   elseif saved == 0 and settings.rarityMenu == 'mythic-up-v1' then minRank = 0 end
+end
+
+-- Value parser: accepts "1e12", "1.5T", "$2Qi/s", "100b", etc.
+local rateSuffixes = {k=1e3, m=1e6, b=1e9, t=1e12, q=1e15, qa=1e15, qi=1e18}
+local function parseRateValue(text)
+  if type(text) ~= 'string' then return nil end
+  local cleaned = text:lower():gsub('%s',''):gsub(',',''):gsub('%$','')
+  if cleaned:sub(-2) == '/s' then cleaned = cleaned:sub(1, -3) end
+  if cleaned == '' then return nil end
+  local num, suffix = cleaned:match('^([%d%.eE%+%-]+)(%a*)$')
+  if not num or suffix == nil then return nil end
+  local n = tonumber(num)
+  if not n or n ~= n or n <= 0 or n == math.huge then return nil end
+  local factor = 1
+  if suffix ~= '' then
+    factor = rateSuffixes[suffix]
+    if not factor then return nil end
+  end
+  local result = n * factor
+  if result ~= result or result <= 0 or result == math.huge then return nil end
+  return result
 end
 
 local originalMake, originalLabel = D.make, D.label
@@ -121,8 +161,12 @@ D.label = function(parent, text, pos, size, color, fontSize)
   return obj
 end
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- KEEP THIS EXACT FROM YOUR ORIGINAL FILE — paste your existing
+-- mutationSpriteData.studs_v05 = {width=512,height=512,data='iVBOR...'} entry.
+-- ═══════════════════════════════════════════════════════════════════════════
 local mutationSpriteData = {
-  studs_v05={width=512,height=512,data='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'},
+  studs_v05={width=512,height=512,data='PASTE_YOUR_ORIGINAL_BASE64_HERE'},
 }
 local mutationSprites = {}
 do
@@ -261,6 +305,8 @@ local function saveSettings()
     local function coords(p) return {p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset} end
     writefile(settingsPath, Http:JSONEncode({
       myServer=othersOnly, minRank=minRank, rarityMenu='mythic-up-v1',
+      autoJoinEnabled=autoJoinEnabled,
+      autoJoinValueEnabled=autoJoinValueEnabled, autoJoinValueMin=autoJoinValueMin,
       menuHotkey=(settings.menuHotkey or 'F'), hotkeyDefaultVersion=2,
       sizeFactor=sizeFactor, panel=coords(panel.Position), icon=coords(open.Position)
     }))
@@ -448,6 +494,15 @@ local unlock = D.make('TextButton', {Text='PREMIUM', Position=UDim2.new(0.60,5,1
   Size=UDim2.new(0.40,-15,0,36), BackgroundColor3=Color3.fromRGB(210,170,35), TextColor3=Color3.new(1,1,1), TextSize=12}, panel)
 access.Visible = PREMIUM_EDITION and AUTO_KEY == ''
 
+local autoJoinBtn = D.make('TextButton', {Text='AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF'), Position=UDim2.new(0,10,1,-44),
+  Size=UDim2.new(1,-20,0,34), BackgroundColor3=autoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50), TextColor3=Color3.new(1,1,1), TextSize=12}, panel)
+autoJoinBtn.Activated:Connect(function()
+  autoJoinEnabled = not autoJoinEnabled
+  autoJoinBtn.Text = 'AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF')
+  autoJoinBtn.BackgroundColor3 = autoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50)
+  saveSettings()
+end)
+
 local themeModal, loadUiAsset, syncCloseArt
 
 local refreshButton = D.make('TextButton', {Text='REFRESH', Position=UDim2.fromOffset(10,54),
@@ -513,30 +568,8 @@ if mutationSprites.studs_v05 then
   wallpaperShade.BackgroundColor3 = Color3.fromRGB(15,16,20); wallpaperShade.BackgroundTransparency = 0.48
 end
 
-task.spawn(function()
-  local url = 'https://raw.githubusercontent.com/mallu837/JenicakesObsiUI/main/assets/background.png.txt'
-  local text
-  if type(game.HttpGet) == 'function' then
-    local ok, res = pcall(function() return game:HttpGet(url) end)
-    if ok and type(res) == 'string' and #res > 100 then text = res end
-  end
-  if type(text) ~= 'string' or text == '' then return end
-  local b64 = text:match('base64,(.+)') or text; b64 = b64:gsub('%s+', '')
-  if b64:sub(1,1) == '"' then b64 = b64:sub(2, -2) end
-  if type(base64decode) ~= 'function' or type(writefile) ~= 'function' or type(getcustomasset) ~= 'function' then return end
-  pcall(function()
-    writefile('jenicakes_bg.png', base64decode(b64))
-    local asset = getcustomasset('jenicakes_bg.png')
-    if type(asset) == 'string' and asset ~= '' and wallpaper.Parent then
-      wallpaper.Image = asset; wallpaper.ScaleType = Enum.ScaleType.Crop; wallpaper.TileSize = UDim2.fromOffset(0, 0)
-      wallpaper.ImageColor3 = Color3.new(1, 1, 1); wallpaper.ImageTransparency = 0.2
-      wallpaperShade.BackgroundColor3 = Color3.fromRGB(45, 20, 60); wallpaperShade.BackgroundTransparency = 0.5
-    end
-  end)
-end)
-
-for _, button in ipairs({scope, myScope, rarity, unlock, refreshButton, sizeMinus, sizePlus}) do styleRaisedButton(button) end
-for _, button in ipairs({scope, myScope, rarity, unlock}) do
+for _, button in ipairs({scope, myScope, rarity, unlock, refreshButton, sizeMinus, sizePlus, autoJoinBtn}) do styleRaisedButton(button) end
+for _, button in ipairs({scope, myScope, rarity, unlock, autoJoinBtn}) do
   button.Font = Enum.Font.FredokaOne
   local caption = button:FindFirstChild('RaisedCaption')
   if caption then
@@ -588,7 +621,7 @@ loadUiAsset(gear, 'gear')
 local settingsOverlay = D.make('TextButton', {Name='SettingsOverlay', Text='', Visible=false,
   Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.32, AutoButtonColor=false, Active=true, ZIndex=50}, panel)
 local settingsBox = D.make('Frame', {Name='SettingsBox', AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
-  Size=UDim2.new(1,-28,0,270), BackgroundColor3=Color3.fromRGB(43,45,50), Active=true, ZIndex=51}, settingsOverlay)
+  Size=UDim2.new(1,-28,0,360), BackgroundColor3=Color3.fromRGB(43,45,50), Active=true, ZIndex=51}, settingsOverlay)
 D.make('UICorner', {CornerRadius=UDim.new(0,4)}, settingsBox)
 themeModal(settingsBox)
 
@@ -628,6 +661,68 @@ local settingsClose = D.make('TextButton', {Name='CloseSettings', Text='×', Pos
 syncCloseArt(settingsClose); settingsClose.Activated:Connect(stopSettings); settingsOverlay.Activated:Connect(stopSettings)
 settingsButton.Activated:Connect(function() if settingsOverlay.Visible then stopSettings() else settingsOverlay.Visible = true end end)
 hotkeyButton.Activated:Connect(function() waitingForHotkey = true; hotkeyButton.Text = 'PRESS A KEY  (ESC TO CANCEL)' end)
+
+-- ═══════════════════ AUTO JOIN BY $/s VALUE (Settings UI) ═══════════════════
+settingsLabel('AUTO JOIN BY $/s VALUE', 250)
+
+local valueJoinInput = D.make('TextBox', {Name='AutoJoinValueInput', Text=D.money(autoJoinValueMin),
+  PlaceholderText='e.g. 1T or 1e12', Position=UDim2.new(0,14,0,285), Size=UDim2.new(0.58,-18,0,38),
+  ClearTextOnFocus=false, BackgroundColor3=Color3.fromRGB(222,225,232),
+  TextXAlignment=Enum.TextXAlignment.Center, ZIndex=55}, settingsBox)
+valueJoinInput.TextSize = 15
+
+local valueJoinToggle = D.make('TextButton', {Name='AutoJoinValueToggle', Text=autoJoinValueEnabled and 'ON' or 'OFF',
+  Position=UDim2.new(0.60,4,0,285), Size=UDim2.new(0.40,-18,0,38),
+  BackgroundColor3=autoJoinValueEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50),
+  TextColor3=Color3.new(1,1,1), TextSize=16, ZIndex=55}, settingsBox)
+valueJoinToggle.Font = Enum.Font.FredokaOne
+
+local valueJoinHint = D.label(settingsBox, 'Joins highest $/s egg at or above this value (ALL SERVERS)',
+  UDim2.fromOffset(14,327), UDim2.new(1,-28,0,16), Color3.fromRGB(200,210,230), 11)
+valueJoinHint.ZIndex = 54; valueJoinHint.TextScaled = true; valueJoinHint.TextXAlignment = Enum.TextXAlignment.Center
+D.make('UITextSizeConstraint', {MinTextSize=1, MaxTextSize=11}, valueJoinHint)
+
+-- Commit helper — used by both TextChanged (debounced) and FocusLost.
+local valueCommitDebounce = nil
+local function commitValueJoinInput()
+  local parsed = parseRateValue(valueJoinInput.Text)
+  if parsed and parsed ~= autoJoinValueMin then
+    autoJoinValueMin = parsed
+    feedAt = -math.huge
+    saveSettings()
+  end
+  -- Reformat to canonical form so the user sees what was actually stored.
+  valueJoinInput.Text = D.money(autoJoinValueMin)
+end
+
+valueJoinToggle.Activated:Connect(function()
+  autoJoinValueEnabled = not autoJoinValueEnabled
+  valueJoinToggle.Text = autoJoinValueEnabled and 'ON' or 'OFF'
+  valueJoinToggle.BackgroundColor3 = autoJoinValueEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50)
+  feedAt = -math.huge
+  saveSettings()
+end)
+
+valueJoinInput:GetPropertyChangedSignal('Text'):Connect(function()
+  if valueCommitDebounce then task.cancel(valueCommitDebounce); valueCommitDebounce = nil end
+  valueCommitDebounce = task.delay(0.35, function()
+    valueCommitDebounce = nil
+    -- Don't re-write the box text while the user is still typing — only
+    -- parse/store silently. The visible reformat happens on FocusLost.
+    local parsed = parseRateValue(valueJoinInput.Text)
+    if parsed and parsed ~= autoJoinValueMin then
+      autoJoinValueMin = parsed
+      feedAt = -math.huge
+      saveSettings()
+    end
+  end)
+end)
+
+valueJoinInput.FocusLost:Connect(function()
+  if valueCommitDebounce then task.cancel(valueCommitDebounce); valueCommitDebounce = nil end
+  commitValueJoinInput()
+end)
+
 local hotkeyConnection = Input.InputBegan:Connect(function(input, processed)
   if input.UserInputType ~= Enum.UserInputType.Keyboard or input.KeyCode == Enum.KeyCode.Unknown then return end
   if waitingForHotkey then
@@ -978,8 +1073,6 @@ local function updateCard(card, entry, i)
   end
 end
 
--- ============ NETWORKING & CONFIGURATION ============
--- Moved above renderer so Join handler can access them
 local function network(url, method, body, hdrs, raw)
   if type(requestFn) ~= 'function' then return nil, 'Executor HTTP unavailable' end
   local waitDeadline = os.clock() + 15
@@ -1064,19 +1157,144 @@ local function refresh()
   clockOffset = (tonumber(data.serverTime) or os.time()*1000)/1000 - os.clock()
   feed = data.items
   feedAt = os.clock()
-  queryStatus = string.format('Updated | %d servers | %d reporters', data.servers or 0, data.participants or 0)
+  queryStatus = string.format('Updated | %d servers | %d participants', data.servers or 0, data.participants or 0)
   return true
 end
--- ============ END NETWORKING ============
 
-local cardsByKey = {}
-local rendering, renderPending, renderQueued = false, false, false
-local function queueRender()
-  if renderQueued or not active then return end
-  renderQueued = true
-  task.defer(function() renderQueued = false; if active then render() end end)
+local function executeJoin(entry, card)
+  if joining or not entry or entry.jobId == game.JobId then return end
+  local placeId = tonumber(entry.placeId)
+  local jobId = entry.jobId
+  if not placeId or type(jobId) ~= 'string' or jobId == '' then return end
+  if (os.clock() + clockOffset) * 1000 >= (entry.expiresAt or 0) then return end
+
+  joining = true
+  joiningKey = entry.key
+  if card then updateCard(card, entry, card.row.LayoutOrder or 1) end
+
+  task.spawn(function()
+    local ok, err = pcall(function()
+      if not config then loadConfig() end
+      if config and config.endpoint then
+        local claim, claimErr = network(config.endpoint..'/v1/join', 'POST',
+          Http:JSONEncode({placeId=placeId, jobId=jobId, uid=entry.uid, reporterId=reporterId, userId=D.player.UserId}),
+          headers()
+        )
+        if claim and claim.allowed ~= true and (claim.unavailable or claim.full) then
+          entry.full = true
+          entry.unavailable = claim.unavailable == true
+          entry.takenConfirmed = claim.takenConfirmed == true
+          if card then pcall(function() updateCard(card, entry, card.row.LayoutOrder or 1) end) end
+          error('Egg no longer available')
+        end
+      end
+      if config then pcall(report) end
+      print('[Jen Join] Teleporting to', placeId, jobId)
+      Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
+    end)
+    if not ok then
+      joining = false; joiningKey = nil
+      lastJoinErrorMsg = 'Join failed: '..tostring(err)
+      lastJoinErrorAt = os.clock()
+      if card then pcall(function() updateCard(card, entry, card.row.LayoutOrder or 1) end) end
+    end
+  end)
+
+  -- Fast unlock. TeleportInitFailed fires in <1s on a bad job; a successful
+  -- teleport unloads this script entirely; the only case this covers is a
+  -- stuck/blocked claim. 2s gives ~2x the churn of the old 4s fallback.
+  task.delay(2, function()
+    if joining and joiningKey == entry.key then
+      joining = false; joiningKey = nil
+    end
+  end)
 end
-local render
+
+local function maybeAutoJoinByValue()
+  if not autoJoinValueEnabled or joining or othersOnly then return end
+  if os.clock() - lastValueJoinAt < 1 then return end   -- was 10s; now a 1s debounce only
+  local now = (os.clock() + clockOffset) * 1000
+  -- Collect *every* viable candidate, skipping jobs we tried very recently,
+  -- then sort highest $/s first so we always advance to the fastest one.
+  local candidates = {}
+  for _, e in ipairs(feed) do
+    if type(e.rate) == 'number' and e.rate >= autoJoinValueMin
+      and type(e.jobId) == 'string' and e.jobId ~= '' and e.jobId ~= game.JobId
+      and e.placeId and (e.expiresAt or 0) > now then
+      local last = valueJoinAttempts[e.jobId]
+      if not last or os.clock() - last >= 20 then   -- was 45s; 20s is still enough to dodge retry spam
+        candidates[#candidates+1] = e
+      end
+    end
+  end
+  if #candidates == 0 then return end
+  table.sort(candidates, function(a, b) return a.rate > b.rate end)
+  local best = candidates[1]
+  valueJoinAttempts[best.jobId] = os.clock()
+  lastValueJoinAt = os.clock()
+  for jobId, t in pairs(valueJoinAttempts) do
+    if os.clock() - t > 300 then valueJoinAttempts[jobId] = nil end
+  end
+  print(string.format('[Jen Auto-Join Value] %s @ %s', tostring(best.name), D.money(best.rate)))
+  executeJoin(best, cardsByKey[best.key])
+end
+
+local function startSpamJoin()
+  -- FIX: when the value-based auto-join is ON, never run the reset fallback.
+  if autoJoinValueEnabled then
+    print('[Jen Auto-Join] Skipped: AUTO JOIN BY $/s VALUE is enabled.')
+    return
+  end
+  print('[Jen Auto-Join] Triggered. Refreshing feed...')
+  pcall(function()
+    if config then refresh() end
+  end)
+  render()
+
+  local waitStart = os.clock()
+  while active and (#currentTopEntries == 0 or currentTopEntries[1].jobId == game.JobId) do
+    if os.clock() - waitStart > 10 then
+      print('[Jen Auto-Join] Timed out waiting for remote targets.')
+      return
+    end
+    task.wait(0.5)
+  end
+
+  local startTime = os.clock()
+  -- 15s window so we can cycle through the top 5 servers.
+  local DURATION = 15
+  local clickIndex = 1
+  local attempts = 0
+
+  task.spawn(function()
+    while active and (os.clock() - startTime) < DURATION do
+      local maxEntries = math.min(5, #currentTopEntries)   -- was 3; walk the full top-5
+      if maxEntries == 0 then
+        task.wait(0.2)
+      else
+        local joinStart = os.clock()
+        while joining and active and (os.clock() - joinStart) < 3
+              and (os.clock() - startTime) < DURATION do
+          task.wait(0.1)
+        end
+
+        if not active or (os.clock() - startTime) >= DURATION then break end
+
+        if clickIndex > maxEntries then clickIndex = 1 end
+        local target = currentTopEntries[clickIndex]
+        if target and target.jobId ~= game.JobId and target.placeId then
+          print(string.format('[Jen Auto-Join] #%d %s @ %s', clickIndex, tostring(target.name), D.money(target.rate or 0)))
+          executeJoin(target, cardsByKey[target.key])
+          attempts = attempts + 1
+        end
+        clickIndex = clickIndex + 1
+        if clickIndex > maxEntries then clickIndex = 1 end
+        task.wait(0.4)   -- was 0.8; roughly 2x more attempts per second window
+      end
+    end
+    print('[Jen Auto-Join] 15s window ended. Attempts: '..attempts)
+  end)
+end
 
 local function renderOnce()
   local passEpoch = queryEpoch
@@ -1130,6 +1348,11 @@ local function renderOnce()
   local limit = PREMIUM_EDITION and 10 or 30
   while #source > limit do source[#source] = nil end
   for i, e in ipairs(source) do e.displayRank = i end
+
+  currentTopEntries = {}
+  for i = 1, math.min(5, #source) do
+    currentTopEntries[i] = source[i]
+  end
 
   local savedScroll = list.CanvasPosition
   local canvasHeight = #source == 0 and 40 or 0
@@ -1288,76 +1511,8 @@ local function renderOnce()
       join.AutoButtonColor = not (entry.full or entry.unavailable)
       join.Selectable = not (entry.full or entry.unavailable)
 
-      -- ============ JOIN HANDLER (FIXED) ============
       join.Activated:Connect(function()
-        local cur = card.entry
-        if not cur then return end
-        if joining then return end
-        if cur.jobId == game.JobId then return end
-
-        local placeId = tonumber(cur.placeId)
-        local jobId = cur.jobId
-        print('[Jen Join] Clicked:', tostring(cur.name), '| placeId:', tostring(placeId), '| jobId:', tostring(jobId))
-
-        if not placeId or type(jobId) ~= 'string' or jobId == '' then
-          lastJoinErrorMsg = 'Invalid entry (no placeId/jobId)'
-          lastJoinErrorAt = os.clock()
-          print('[Jen Join] Abort: invalid IDs')
-          return
-        end
-
-        if (os.clock() + clockOffset) * 1000 >= (cur.expiresAt or 0) then
-          lastJoinErrorMsg = 'Report expired; refreshing'
-          lastJoinErrorAt = os.clock()
-          feedAt = -math.huge
-          return
-        end
-
-        joining = true; joiningKey = cur.key
-        updateCard(card, cur, card.row.LayoutOrder or 1)
-
-        task.spawn(function()
-          local ok, err = pcall(function()
-            if not config then
-              local loaded, msg = loadConfig()
-              print('[Jen Join] Config load:', tostring(loaded), tostring(msg))
-            end
-
-            if config and config.endpoint then
-              local claim, claimErr = network(
-                config.endpoint..'/v1/join', 'POST',
-                Http:JSONEncode({placeId=placeId, jobId=jobId, uid=cur.uid, reporterId=reporterId, userId=D.player.UserId}),
-                headers()
-              )
-              print('[Jen Join] Claim:', tostring(claim and claim.allowed), tostring(claimErr))
-              if claim and claim.allowed ~= true and (claim.unavailable or claim.full) then
-                cur.full = true; cur.unavailable = claim.unavailable == true; cur.takenConfirmed = claim.takenConfirmed == true
-                pcall(function() updateCard(card, cur, card.row.LayoutOrder or 1) end)
-                error('Egg no longer available ('..tostring(claim.error or 'reserved')..')')
-              end
-            end
-
-            if config then pcall(function() report() end) end
-
-            print('[Jen Join] Teleporting to', placeId, jobId)
-            Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
-          end)
-
-          if not ok then
-            joining = false; joiningKey = nil
-            lastJoinErrorMsg = 'Join failed: '..tostring(err)
-            lastJoinErrorAt = os.clock()
-            print('[Jen Join] Error:', tostring(err))
-            pcall(function() updateCard(card, cur, card.row.LayoutOrder or 1) end)
-          end
-        end)
-
-        task.delay(12, function()
-          if joining and joiningKey == cur.key then
-            joining = false; joiningKey = nil
-            print('[Jen Join] Timeout')
-          end
-        end)
+        executeJoin(card.entry, card)
       end)
     end
     card.entry = entry
@@ -1403,6 +1558,7 @@ refreshButton.Activated:Connect(function()
         if not loaded then error(message) end
       end
       render()
+      if autoJoinValueEnabled then pcall(maybeAutoJoinByValue) end
     end)
     refreshing = false
     if active then
@@ -1433,18 +1589,24 @@ task.spawn(function()
         local success, message = loadConfig()
         if not success then error(message) end
       end
-      if os.clock() - lastReport >= 20 then
+      local reportInterval = autoJoinValueEnabled and 10 or 20
+      if os.clock() - lastReport >= reportInterval then
         lastReport = os.clock()
         local success, message = report()
         reportStatus = success and message or 'Share: '..tostring(message)
       end
-      if not othersOnly and os.clock() - feedAt >= 8 then
+      local refreshInterval = autoJoinValueEnabled and 3 or 8
+      if not othersOnly and os.clock() - feedAt >= refreshInterval then
         local success, message = refresh()
         if not success then queryStatus = 'Finder: '..tostring(message) end
+        -- Fire *immediately* after the feed updates so a fresh high-$/s egg
+        -- triggers a join on the same tick instead of waiting for the next poll.
+        if autoJoinValueEnabled then pcall(maybeAutoJoinByValue) end
       end
+      maybeAutoJoinByValue()
     end)
     if not ok then queryStatus = tostring(err) end
-    task.wait(2)
+    task.wait(autoJoinValueEnabled and 0.5 or 2)
   end
 end)
 
@@ -1781,9 +1943,24 @@ panel.Visible = true
 render()
 
 task.spawn(function()
+  local lastReset = nil
   while active do
     local cycle = cycleInfo()
     if cycle then
+      if lastReset == nil then
+        lastReset = cycle.resetAt
+      elseif lastReset ~= cycle.resetAt then
+        lastReset = cycle.resetAt
+        feedAt = -math.huge
+        print('[Jen Auto-Join] Reset detected! Waiting 5 seconds...')
+        task.spawn(function()
+          task.wait(5)
+          if active and autoJoinEnabled then
+            startSpamJoin()
+          end
+        end)
+      end
+
       local seconds = math.max(0, math.ceil(cycle.remaining))
       resetTimer.Text = cycle.running and string.format('RESET %02d:%02d', math.floor(seconds/60), seconds%60) or 'RESET PAUSED'
       resetTimer.TextColor3 = cycle.running and seconds <= 60 and Color3.fromRGB(255,85,85)
