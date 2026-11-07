@@ -1,5 +1,168 @@
-{
-  "endpoint": "https://reviewing-preston-symantec-newspapers.trycloudflare.com",
-  "version": 1,
-  "roomKey": "426611e6a75e422083975103c24315ebdc5ff8b495c142c3ac41445e14723f8a"
-}
+--[[
+  CeboScanner — DIAGNOSTIC BUILD
+  Prints every step so we can see exactly where it fails.
+]]
+
+print("═══════════════════════════════════════════════════")
+print("[DIAG] Script started:", os.date("%H:%M:%S"))
+print("═══════════════════════════════════════════════════")
+
+-- ── 1. Environment ─────────────────────────────────────
+print("[DIAG] PlaceId          :", game.PlaceId)
+print("[DIAG] JobId            :", game.JobId)
+print("[DIAG] Executor request :", type(request))
+print("[DIAG] syn.request      :", type(syn) == "table" and type(syn.request) or "nil")
+print("[DIAG] http.request     :", type(http) == "table" and type(http.request) or "nil")
+print("[DIAG] http_request     :", type(http_request))
+print("[DIAG] WebSocket        :", type(WebSocket))
+print("[DIAG] WebSocket.connect:", type(WebSocket) == "table" and type(WebSocket.connect) or "n/a")
+
+if game.PlaceId ~= 107778070777162 then
+    warn("[DIAG] ❌ WRONG GAME — expected PlaceId 107778070777162, got", game.PlaceId)
+    warn("[DIAG] Script will NOT continue. Join the correct game first.")
+    return
+end
+
+repeat task.wait() until game:IsLoaded()
+print("[DIAG] ✅ Game loaded")
+
+local Players           = game:GetService("Players")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer       = Players.LocalPlayer
+
+print("[DIAG] LocalPlayer      :", LocalPlayer and LocalPlayer.Name or "nil")
+
+-- ── 2. Networking folder ───────────────────────────────
+local Packages = ReplicatedStorage:FindFirstChild("Packages")
+print("[DIAG] Packages folder  :", Packages and "found" or "MISSING")
+
+local Networking = Packages and Packages:FindFirstChild("Networking")
+print("[DIAG] Networking folder:", Networking and "found" or "MISSING")
+
+if not Networking then
+    warn("[DIAG] ❌ Networking folder missing — cannot scan eggs.")
+    return
+end
+
+local snapRF = Networking:FindFirstChild("RF/EggWorld/AskFieldEggSnapshot")
+print("[DIAG] Snapshot RF      :", snapRF and "found" or "MISSING")
+
+if not snapRF then
+    warn("[DIAG] ❌ RF/EggWorld/AskFieldEggSnapshot missing!")
+    print("[DIAG] Networking children:")
+    for _, c in ipairs(Networking:GetChildren()) do
+        print("         •", c.Name, "(" .. c.ClassName .. ")")
+    end
+    return
+end
+
+-- ── 3. Snapshot call ───────────────────────────────────
+print("[DIAG] Calling snapshot RF...")
+local ok, res = pcall(function() return snapRF:InvokeServer() end)
+if not ok then
+    warn("[DIAG] ❌ Snapshot call errored:", tostring(res))
+    return
+end
+print("[DIAG] Snapshot returned:", type(res))
+if type(res) == "table" then
+    local count = 0
+    if type(res.Records) == "table" then
+        for _ in pairs(res.Records) do count = count + 1 end
+    end
+    print("[DIAG] Records count    :", count)
+    print("[DIAG] Result keys      :")
+    for k in pairs(res) do print("         •", k) end
+    -- print first record so we know the shape
+    for _, rec in pairs(res.Records or {}) do
+        print("[DIAG] Sample record   :")
+        for k, v in pairs(rec) do
+            if type(v) ~= "table" then print("         •", k, "=", tostring(v)) end
+        end
+        break
+    end
+else
+    warn("[DIAG] ❌ Snapshot did not return a table")
+    return
+end
+
+-- ── 4. Assets / Mutations modules ──────────────────────
+local okA, Assets = pcall(function() return require(ReplicatedStorage.Data.Assets) end)
+print("[DIAG] Assets module   :", okA and "loaded" or ("FAILED: " .. tostring(Assets)))
+
+local okM, Mutations = pcall(function() return require(ReplicatedStorage.Shared.Modules.Mutations) end)
+print("[DIAG] Mutations module:", okM and "loaded" or ("FAILED: " .. tostring(Mutations)))
+
+-- ── 5. HTTP to Firebase ────────────────────────────────
+local function httpTest(url)
+    print("[DIAG] GET", url)
+    if type(request) == "function" then
+        local ok, r = pcall(request, {Url = url, Method = "GET"})
+        if ok and type(r) == "table" then
+            print("[DIAG]   → status:", r.StatusCode or r.Status, " body:", tostring(r.Body):sub(1, 120))
+            return r.StatusCode or r.Status, r.Body
+        else
+            print("[DIAG]   → request() failed:", tostring(r))
+        end
+    end
+    if type(syn) == "table" and type(syn.request) == "function" then
+        local ok, r = pcall(syn.request, {Url = url, Method = "GET"})
+        if ok and type(r) == "table" then
+            print("[DIAG]   → status:", r.StatusCode or r.Status, " body:", tostring(r.Body):sub(1, 120))
+            return r.StatusCode or r.Status, r.Body
+        end
+    end
+    local ok, r = pcall(function()
+        return HttpService:RequestAsync({Url = url, Method = "GET"})
+    end)
+    if ok and type(r) == "table" then
+        print("[DIAG]   → RequestAsync status:", r.StatusCode, " body:", tostring(r.Body):sub(1, 120))
+        return r.StatusCode, r.Body
+    end
+    if game.HttpGet then
+        local ok2, b = pcall(game.HttpGet, game, url)
+        if ok2 then print("[DIAG]   → HttpGet body:", tostring(b):sub(1, 120)); return 200, b end
+    end
+    warn("[DIAG]   → no HTTP method succeeded")
+    return 0, nil
+end
+
+local DB = "https://newlogs-7c69a-default-rtdb.firebaseio.com"
+local code1, body1 = httpTest(DB .. "/config/minValue.json")
+if code1 == 401 or code1 == 403 then
+    warn("[DIAG] ❌ Firebase denies access (" .. code1 .. ") — the DB is locked down.")
+end
+if code1 == 0 then
+    warn("[DIAG] ❌ No HTTP wrapper works in this executor — script cannot talk to Firebase.")
+end
+if code1 == 200 then
+    print("[DIAG] ✅ Firebase reachable. minValue =", body1)
+end
+
+-- ── 6. WebSocket ───────────────────────────────────────
+if type(WebSocket) == "table" and type(WebSocket.connect) == "function" then
+    print("[DIAG] Testing WebSocket...")
+    local ok, ws = pcall(WebSocket.connect, "wss://newlogs-7c69a-default-rtdb.firebaseio.com/.ws?v=5&ns=newlogs-7c69a-default-rtdb")
+    if ok and ws then
+        print("[DIAG] ✅ WebSocket connected")
+        local got = false
+        pcall(function()
+            ws.OnMessage:Connect(function(m) print("[DIAG]   WS msg:", tostring(m):sub(1, 80)); got = true end)
+        end)
+        task.wait(3)
+        if not got then print("[DIAG]   (no message in 3s — may still be fine)") end
+        pcall(function() ws:Close() end)
+    else
+        warn("[DIAG] ❌ WebSocket connect failed:", tostring(ws))
+    end
+else
+    warn("[DIAG] ⚠️  WebSocket not available — script will use REST-only polling")
+end
+
+print("═══════════════════════════════════════════════════")
+print("[DIAG] Done. If everything says ✅ but the main")
+print("[DIAG] script does nothing, look at minValue above:")
+print("[DIAG] only eggs with Value ≥ max(250,000,000, minValue)")
+print("[DIAG] are reported. If no egg is that valuable,")
+print("[DIAG] the scanner legitimately has nothing to report.")
+print("═══════════════════════════════════════════════════")
