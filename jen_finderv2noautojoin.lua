@@ -1,4 +1,7 @@
--- Jen Finder — Full Working Finder (Auto-Join Fixed + Top 5 Fallback + Auto-Join-By-Value)
+-- an u do add webhook notif on discord where they joined 
+-- language: Lua, file: jen_finder.lua, target: Roblox executor
+
+-- Jen Finder — Full Working Finder (Instant-Fire Join + Fast Feed + Typed Income Gate + Compact Join-Only Notifs + Discord Webhook)
 local Players = game:GetService('Players')
 local RS = game:GetService('ReplicatedStorage')
 local player = Players.LocalPlayer
@@ -12,26 +15,34 @@ local function module(path)
   return obj and require(obj) or nil
 end
 
-local cycleModule = module('Shared.Util.AreaEggCycle')
+local cycleModule
+
+local function ensureCycleModule()
+  if cycleModule then return cycleModule end
+  cycleModule = module('Shared.Util.AreaEggCycle')
+  return cycleModule
+end
+
 local function cycleInfo()
-  if not cycleModule then return nil end
+  local cm = ensureCycleModule()
+  if not cm then return nil end
   local ok, info = pcall(function()
     local now = workspace:GetServerTimeNow()
-    local running = cycleModule.IsRunning()
-    local remaining = cycleModule.SecondsUntilReset(now)
+    local running = cm.IsRunning()
+    local remaining = cm.SecondsUntilReset(now)
     local respawnAt
-    if type(cycleModule.PeriodStartTime) == 'function' and type(cycleModule.PeriodIndexAt) == 'function' then
-      local known, value = pcall(function() return cycleModule.PeriodStartTime(cycleModule.PeriodIndexAt(now)) * 1000 end)
+    if type(cm.PeriodStartTime) == 'function' and type(cm.PeriodIndexAt) == 'function' then
+      local known, value = pcall(function() return cm.PeriodStartTime(cm.PeriodIndexAt(now)) * 1000 end)
       if known and type(value) == 'number' then respawnAt = value end
     end
-    return {resetAt = cycleModule.NextResetTime(now) * 1000, respawnAt = respawnAt, remaining = remaining, running = running}
+    return {resetAt = cm.NextResetTime(now) * 1000, respawnAt = respawnAt, remaining = remaining, running = running}
   end)
   return ok and info or nil
 end
 
 local gui = Instance.new('ScreenGui')
 gui.Name = 'TENSHI_FINDER_BETA'
-gui:SetAttribute('TenshiUIBuild','PUBLIC-V05-TOP10')
+gui:SetAttribute('TenshiUIBuild','PUBLIC-V10-FASTFEED-NOTIF-WEBHOOK')
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
@@ -70,15 +81,21 @@ local D = {
 local PREMIUM_EDITION = false
 local AUTO_KEY = ''
 local DISCORD = 'https://discord.gg/8zxVj7Ygeg'
+
+-- ============================================================
+-- DISCORD WEBHOOK CONFIG
+-- Paste your webhook URL below. Leave as '' to disable.
+-- Format: https://discord.com/api/webhooks/ID/TOKEN
+-- ============================================================
+local DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1569351050597765120/SQE2hCeuuaLf7ducoBPyTuiGgfvXuEUGA--y3J-PWILFdnUrjHJM5M2cP2U44iTOF7-l' -- ⬅️ paste webhook URL here
+local DISCORD_WEBHOOK_ENABLED = true -- toggle at runtime (set false to silence)
+
 local Http = game:GetService('HttpService')
 
 local active = true
 local othersOnly = false
 local autoJoinEnabled = true
-local autoJoinValueEnabled = false
-local autoJoinValueMin = 1e12
-local valueJoinAttempts = {}
-local lastValueJoinAt = 0
+local incomeAutoJoinEnabled = true
 local queryEpoch = 0
 local config, configAt = nil, -math.huge
 local feed, feedAt = {}, 0
@@ -86,13 +103,313 @@ local clockOffset = 0
 local reportStatus = 'Connecting'
 local queryStatus = ''
 local minRate, minRank = 0, 6
+local minIncome = 0
 local joining, joiningKey = false, nil
 local reporterId = Http:GenerateGUID(false)
 local networkBusy = false
 local latestEntries = {}
 local lastJoinErrorMsg, lastJoinErrorAt = nil, 0
 local currentTopEntries = {}
+local blockedServers = {}
+local BLOCK_TTL = 300
+local recentlyAttempted = {}
+local ATTEMPT_TTL = 30
+local panelShownAt = 0
+local fastScanSignal = false
 D.entries = function() return latestEntries end
+
+-- ============================================================
+-- NOTIFICATION STATE
+-- ============================================================
+local notifReady = false
+local notifQueue = {}
+
+-- ============================================================
+-- PET/EGG JOIN NOTIFICATION (compact side-panel toast)
+-- Shows: Name · Kg · $/s · Rarity (single tight card)
+-- ============================================================
+local Notif = {}
+do
+  local notifGui = Instance.new('ScreenGui')
+  notifGui.Name = 'JenJoinNotifs'
+  notifGui.ResetOnSpawn = false
+  notifGui.IgnoreGuiInset = true
+  notifGui.DisplayOrder = 1250
+  pcall(function() notifGui.ScreenInsets = Enum.ScreenInsets.None end)
+  notifGui.Parent = parent
+
+  local container = Instance.new('Frame')
+  container.Name = 'NotifStack'
+  container.AnchorPoint = Vector2.new(1, 1)
+  container.Position = UDim2.new(1, -10, 1, -10)
+  container.Size = UDim2.new(0, 220, 1, -20)
+  container.BackgroundTransparency = 1
+  container.Parent = notifGui
+
+  local layout = Instance.new('UIListLayout')
+  layout.SortOrder = Enum.SortOrder.LayoutOrder
+  layout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+  layout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+  layout.Padding = UDim.new(0, 5)
+  layout.Parent = container
+
+  local order = 0
+  local alive = true
+  notifGui.Destroying:Connect(function() alive = false end)
+
+  local accent = {
+    divine=Color3.fromRGB(255,205,55), eternal=Color3.fromRGB(218,202,236),
+    secret=Color3.fromRGB(255,255,255), cosmic=Color3.fromRGB(190,85,255),
+    mythic=Color3.fromRGB(255,75,85), legendary=Color3.fromRGB(255,155,45),
+    epic=Color3.fromRGB(255,110,200), rare=Color3.fromRGB(65,165,255),
+    uncommon=Color3.fromRGB(105,220,120), common=Color3.fromRGB(220,225,235),
+  }
+
+  local function fmtWeight(v)
+    if type(v) ~= 'number' or v ~= v or v <= 0 then return '—' end
+    if v >= 1e12 then return string.format('%.2g', v) .. 'Kg' end
+    if v >= 1e9 then return string.format('%.2fB', v/1e9):gsub('0+$',''):gsub('%.$','') .. 'Kg' end
+    if v >= 1e6 then return string.format('%.2fM', v/1e6):gsub('0+$',''):gsub('%.$','') .. 'Kg' end
+    if v >= 1000 then return string.format('%.2fK', v/1000):gsub('0+$',''):gsub('%.$','') .. 'Kg' end
+    return string.format('%.2f', v):gsub('0+$',''):gsub('%.$','') .. 'Kg'
+  end
+
+  local function fmtMoney(v)
+    if type(v) ~= 'number' or v ~= v or v < 0 then return '—' end
+    for _, e in ipairs({{1e18,'Qi'},{1e15,'Qa'},{1e12,'T'},{1e9,'B'},{1e6,'M'},{1e3,'K'}}) do
+      if v >= e[1] then return string.format('$%.2f%s/s', v/e[1], e[2]) end
+    end
+    return string.format('$%.2f/s', v)
+  end
+
+  function Notif.push(name, weightKg, incomePerSec, rarityName)
+    if not alive then return end
+    order = order + 1
+    local card = Instance.new('Frame')
+    card.Size = UDim2.new(1, 0, 0, 46)
+    card.BackgroundColor3 = Color3.fromRGB(26, 28, 36)
+    card.BackgroundTransparency = 0.06
+    card.BorderSizePixel = 0
+    card.LayoutOrder = order
+    card.Parent = container
+
+    local corner = Instance.new('UICorner')
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = card
+
+    local key = tostring(rarityName or ''):lower():gsub('%s+','')
+    local accentColor = accent[key] or Color3.fromRGB(120, 200, 255)
+
+    local stroke = Instance.new('UIStroke')
+    stroke.Color = accentColor
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.4
+    stroke.Parent = card
+
+    local stripe = Instance.new('Frame')
+    stripe.Size = UDim2.new(0, 3, 1, 0)
+    stripe.BackgroundColor3 = accentColor
+    stripe.BorderSizePixel = 0
+    stripe.Parent = card
+    local stripeCorner = Instance.new('UICorner')
+    stripeCorner.CornerRadius = UDim.new(0, 6)
+    stripeCorner.Parent = stripe
+
+    local title = Instance.new('TextLabel')
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, 8, 0, 4)
+    title.Size = UDim2.new(1, -90, 0, 18)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextColor3 = accentColor
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Text = tostring(name or 'Unknown')
+    title.Parent = card
+
+    local moneyLabel = Instance.new('TextLabel')
+    moneyLabel.BackgroundTransparency = 1
+    moneyLabel.Position = UDim2.new(1, -82, 0, 4)
+    moneyLabel.Size = UDim2.new(0, 74, 0, 18)
+    moneyLabel.Font = Enum.Font.GothamBold
+    moneyLabel.TextSize = 12
+    moneyLabel.TextColor3 = Color3.fromRGB(120, 240, 140)
+    moneyLabel.TextXAlignment = Enum.TextXAlignment.Right
+    moneyLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    moneyLabel.Text = fmtMoney(incomePerSec)
+    moneyLabel.Parent = card
+
+    local weightLabel = Instance.new('TextLabel')
+    weightLabel.BackgroundTransparency = 1
+    weightLabel.Position = UDim2.new(0, 8, 0, 23)
+    weightLabel.Size = UDim2.new(0.5, -10, 0, 18)
+    weightLabel.Font = Enum.Font.Gotham
+    weightLabel.TextSize = 12
+    weightLabel.TextColor3 = Color3.fromRGB(185, 220, 255)
+    weightLabel.TextXAlignment = Enum.TextXAlignment.Left
+    weightLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    weightLabel.Text = fmtWeight(weightKg)
+    weightLabel.Parent = card
+
+    local rarityLabel = Instance.new('TextLabel')
+    rarityLabel.BackgroundTransparency = 1
+    rarityLabel.Position = UDim2.new(0.5, 0, 0, 23)
+    rarityLabel.Size = UDim2.new(0.5, -8, 0, 18)
+    rarityLabel.Font = Enum.Font.GothamBold
+    rarityLabel.TextSize = 11
+    rarityLabel.TextColor3 = accentColor
+    rarityLabel.TextXAlignment = Enum.TextXAlignment.Right
+    rarityLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    rarityLabel.Text = tostring(rarityName or 'Unknown')
+    rarityLabel.Parent = card
+
+    local TweenService = game:GetService('TweenService')
+    card.Position = UDim2.new(0, 40, 0, 0)
+    TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+      Position = UDim2.new(0, 0, 0, 0),
+      BackgroundTransparency = 0.06,
+    }):Play()
+
+    task.delay(4, function()
+      if not card.Parent then return end
+      local t = TweenService:Create(card, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+        Position = UDim2.new(0, 40, 0, 0),
+        BackgroundTransparency = 1,
+      })
+      t:Play()
+      t.Completed:Connect(function() if card.Parent then card:Destroy() end end)
+    end)
+  end
+end
+notifReady = true
+for _, q in ipairs(notifQueue) do pcall(Notif.push, q[1], q[2], q[3], q[4]) end
+table.clear(notifQueue)
+
+-- ============================================================
+-- DISCORD WEBHOOK — fires when the finder teleports into a server
+-- ============================================================
+local rarityColorsHex = {
+  divine=0xFFCD37, eternal=0xDACAEC, secret=0xFFFFFF, cosmic=0xBE55FF,
+  mythic=0xFF4B55, legendary=0xFF9B2D, epic=0xFF6EC8, rare=0x41A5FF,
+  uncommon=0x69DC78, common=0xDCE1EB,
+}
+
+local webhookLastSent = 0
+local webhookMinInterval = 1.5 -- seconds; prevents spam if multiple joins in quick succession
+
+local function sendDiscordWebhook(entry, placeId, jobId)
+  if not DISCORD_WEBHOOK_ENABLED then return end
+  if type(DISCORD_WEBHOOK) ~= 'string' or DISCORD_WEBHOOK == '' then return end
+  if type(requestFn) ~= 'function' or not entry then return end
+  if os.clock() - webhookLastSent < webhookMinInterval then return end
+  webhookLastSent = os.clock()
+
+  local function fm(v)
+    if type(v) ~= 'number' or v ~= v or v < 0 then return '—' end
+    for _, e in ipairs({{1e18,'Qi'},{1e15,'Qa'},{1e12,'T'},{1e9,'B'},{1e6,'M'},{1e3,'K'}}) do
+      if v >= e[1] then return string.format('$%.2f%s/s', v/e[1], e[2]) end
+    end
+    return string.format('$%.2f/s', v)
+  end
+
+  local function fw(v)
+    if type(v) ~= 'number' or v ~= v or v <= 0 then return '—' end
+    if v >= 1e12 then return string.format('%.2fT Kg', v/1e12) end
+    if v >= 1e9 then return string.format('%.2fB Kg', v/1e9) end
+    if v >= 1e6 then return string.format('%.2fM Kg', v/1e6) end
+    if v >= 1000 then return string.format('%.2fK Kg', v/1000) end
+    return string.format('%.2f Kg', v)
+  end
+
+  local key = tostring(entry.rarity or ''):lower():gsub('%s+','')
+  local color = rarityColorsHex[key] or 0x78C8FF
+
+  local resolvedPlace = tostring(placeId or entry.placeId or game.PlaceId)
+  local resolvedJob = tostring(jobId or entry.jobId or game.JobId)
+  local link = string.format('https://www.roblox.com/games/%s?gameInstanceId=%s', resolvedPlace, resolvedJob)
+
+  local mutations = tostring(entry.mutations or entry.mutationText or '')
+  if mutations == '' or mutations:lower():find('none', 1, true) then mutations = 'None' end
+
+  local body = Http:JSONEncode({
+    username = 'Jen Finder',
+    avatar_url = 'https://github.com/mallu837/sae/blob/main/Jen.png',
+    embeds = {{
+      title = '✅ Joined Server',
+      url = link,
+      description = string.format('**%s**\n[Join Server »](%s)',
+        tostring(entry.name or 'Unknown'), link),
+      color = color,
+      fields = {
+        {name = '💰 Income', value = fm(entry.rate), inline = true},
+        {name = '⚖️ Weight', value = fw(entry.weight), inline = true},
+        {name = '⭐ Rarity', value = tostring(entry.rarity or 'Unknown'), inline = true},
+        {name = '🧬 Mutations', value = mutations, inline = true},
+        {name = '🌐 Place ID', value = '`'..resolvedPlace..'`', inline = true},
+        {name = '👤 Player', value = '`'..tostring(D.player.Name or '?')..'`', inline = true},
+        {name = '🎯 Job ID', value = '`'..resolvedJob..'`', inline = false},
+      },
+      footer = {text = 'Jen Finder • '..os.date('%H:%M:%S')},
+      timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ'),
+    }},
+  })
+
+  task.spawn(function()
+    local ok, err = pcall(requestFn, {
+      Url = DISCORD_WEBHOOK,
+      Method = 'POST',
+      Headers = {['Content-Type'] = 'application/json'},
+      Body = body,
+      Timeout = 5,
+    })
+    if not ok then
+      warn('[Jen Webhook] failed:', tostring(err))
+    end
+  end)
+end
+
+-- ============================================================
+-- JOIN-TIME NOTIF HELPER (fires ONLY when you actually teleport)
+-- ============================================================
+local function notifOnJoin(entry)
+  if not entry then return end
+  local name = entry.name
+  local weight = entry.weight
+  local income = entry.rate
+  local rarity = entry.rarity
+  if notifReady then
+    pcall(Notif.push, name, weight, income, rarity)
+  else
+    notifQueue[#notifQueue+1] = {name, weight, income, rarity}
+  end
+  pcall(sendDiscordWebhook, entry, entry.placeId, entry.jobId)
+  pcall(function()
+    print(string.format('[Jen Join] -> %s | %s Kg | %s | %s',
+      tostring(name), tostring(weight or '?'),
+      tostring(income or '?'), tostring(rarity or '?')))
+  end)
+end
+
+-- ============================================================
+-- /s CHAT COMMAND — manually fire notif for top entry
+-- ============================================================
+task.spawn(function()
+  local ok = pcall(function()
+    local plr = Players.LocalPlayer
+    plr.Chatted:Connect(function(msg)
+      local lower = tostring(msg):lower():gsub('^%s+',''):gsub('%s+$','')
+      if lower == '/s' then
+        local best = latestEntries[1] or currentTopEntries[1]
+        if best then
+          Notif.push(best.name, best.weight, best.rate, best.rarity)
+        else
+          Notif.push('No pet found', nil, nil, 'common')
+        end
+      end
+    end)
+  end)
+  if not ok then warn('[Jen] /s chat hook failed') end
+end)
 
 local cardsByKey = {}
 local rendering, renderPending, renderQueued = false, false, false
@@ -114,33 +431,14 @@ if type(readfile) == 'function' then
 end
 if type(settings.myServer) == 'boolean' then othersOnly = settings.myServer end
 if type(settings.autoJoinEnabled) == 'boolean' then autoJoinEnabled = settings.autoJoinEnabled end
-if type(settings.autoJoinValueEnabled) == 'boolean' then autoJoinValueEnabled = settings.autoJoinValueEnabled end
-if type(settings.autoJoinValueMin) == 'number' and settings.autoJoinValueMin > 0 then autoJoinValueMin = settings.autoJoinValueMin end
+if type(settings.incomeAutoJoinEnabled) == 'boolean' then incomeAutoJoinEnabled = settings.incomeAutoJoinEnabled end
 if type(settings.minRank) == 'number' then
   local saved = math.floor(settings.minRank)
   if saved >= 6 and saved <= 10 then minRank = saved
   elseif saved == 0 and settings.rarityMenu == 'mythic-up-v1' then minRank = 0 end
 end
-
--- Value parser: accepts "1e12", "1.5T", "$2Qi/s", "100b", etc.
-local rateSuffixes = {k=1e3, m=1e6, b=1e9, t=1e12, q=1e15, qa=1e15, qi=1e18}
-local function parseRateValue(text)
-  if type(text) ~= 'string' then return nil end
-  local cleaned = text:lower():gsub('%s',''):gsub(',',''):gsub('%$','')
-  if cleaned:sub(-2) == '/s' then cleaned = cleaned:sub(1, -3) end
-  if cleaned == '' then return nil end
-  local num, suffix = cleaned:match('^([%d%.eE%+%-]+)(%a*)$')
-  if not num or suffix == nil then return nil end
-  local n = tonumber(num)
-  if not n or n ~= n or n <= 0 or n == math.huge then return nil end
-  local factor = 1
-  if suffix ~= '' then
-    factor = rateSuffixes[suffix]
-    if not factor then return nil end
-  end
-  local result = n * factor
-  if result ~= result or result <= 0 or result == math.huge then return nil end
-  return result
+if type(settings.minIncome) == 'number' and settings.minIncome == settings.minIncome and settings.minIncome >= 0 then
+  minIncome = math.floor(settings.minIncome)
 end
 
 local originalMake, originalLabel = D.make, D.label
@@ -159,46 +457,6 @@ D.label = function(parent, text, pos, size, color, fontSize)
   local obj = originalLabel(parent, text, pos, size, color or Color3.fromRGB(240,242,255), math.max(fontSize or 15, 14))
   obj.Font = Enum.Font.GothamBold; obj.TextStrokeColor3 = Color3.new(0,0,0); obj.TextStrokeTransparency = 0.45
   return obj
-end
-
--- ═══════════════════════════════════════════════════════════════════════════
--- KEEP THIS EXACT FROM YOUR ORIGINAL FILE — paste your existing
--- mutationSpriteData.studs_v05 = {width=512,height=512,data='iVBOR...'} entry.
--- ═══════════════════════════════════════════════════════════════════════════
-local mutationSpriteData = {
-  studs_v05={width=512,height=512,data='PASTE_YOUR_ORIGINAL_BASE64_HERE'},
-}
-local mutationSprites = {}
-do
-  local asset = getcustomasset or getsynasset
-  if type(asset) == 'function' and type(writefile) == 'function' then
-    local alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-    local values = {}
-    for i = 1, #alphabet do values[alphabet:sub(i,i)] = i-1 end
-    local function decode(value)
-      local out, buffer, bits = {}, 0, 0
-      for i = 1, #value do
-        local digit = values[value:sub(i,i)]
-        if digit then
-          buffer = buffer * 64 + digit; bits = bits + 6
-          if bits >= 8 then
-            bits = bits - 8; out[#out+1] = string.char(math.floor(buffer / 2^bits) % 256); buffer = buffer % 2^bits
-          end
-        end
-      end
-      return table.concat(out)
-    end
-    D.decodeAsset = decode
-    for key, spec in pairs(mutationSpriteData) do
-      local ok, uri = pcall(function()
-        local filename = 'jen_minecraft_'..key..'_v1.png'
-        writefile(filename, decode(spec.data)); return asset(filename)
-      end)
-      if ok and type(uri) == 'string' then
-        mutationSprites[key] = {image=uri, width=spec.width, height=spec.height}
-      end
-    end
-  end
 end
 
 local panel = D.make('Frame', {AnchorPoint=Vector2.new(1,0.5), Position=UDim2.new(1,-18,0.5,0),
@@ -305,8 +563,7 @@ local function saveSettings()
     local function coords(p) return {p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset} end
     writefile(settingsPath, Http:JSONEncode({
       myServer=othersOnly, minRank=minRank, rarityMenu='mythic-up-v1',
-      autoJoinEnabled=autoJoinEnabled,
-      autoJoinValueEnabled=autoJoinValueEnabled, autoJoinValueMin=autoJoinValueMin,
+      autoJoinEnabled=autoJoinEnabled, incomeAutoJoinEnabled=incomeAutoJoinEnabled, minIncome=minIncome,
       menuHotkey=(settings.menuHotkey or 'F'), hotkeyDefaultVersion=2,
       sizeFactor=sizeFactor, panel=coords(panel.Position), icon=coords(open.Position)
     }))
@@ -361,10 +618,6 @@ local closeArt = D.make('ImageLabel', {Size=UDim2.fromScale(1,1), BackgroundTran
   ScaleType=Enum.ScaleType.Fit, Active=false}, close)
 
 local suppressOpenUntil = 0
-open.Activated:Connect(function()
-  if os.clock() < suppressOpenUntil then return end
-  panel.Visible = not panel.Visible; D.localPanel.Visible = not panel.Visible
-end)
 close.Activated:Connect(function() panel.Visible = false; D.localPanel.Visible = true end)
 
 local Input = game:GetService('UserInputService')
@@ -392,10 +645,25 @@ draggable(open, open, true)
 local launcherHit = D.make('TextButton', {Name='LauncherHitArea', Text='', AutoButtonColor=false,
   BackgroundTransparency=1, Position=UDim2.fromOffset(-8,-8), Size=UDim2.new(1,16,1,16), ZIndex=5}, open)
 draggable(open, launcherHit, true)
-launcherHit.Activated:Connect(function()
+
+local function prewarmOnOpen()
+  if not config or os.clock() - configAt > 30 then pcall(loadConfig) end
+  if not othersOnly then pcall(refresh) end
+  queueRender()
+end
+
+local function togglePanel()
   if os.clock() < suppressOpenUntil then return end
-  panel.Visible = not panel.Visible; D.localPanel.Visible = not panel.Visible
-end)
+  panel.Visible = not panel.Visible
+  D.localPanel.Visible = not panel.Visible
+  if panel.Visible then
+    panelShownAt = os.clock()
+    task.spawn(prewarmOnOpen)
+  end
+end
+open.Activated:Connect(togglePanel)
+launcherHit.Activated:Connect(togglePanel)
+
 local moveConnection = Input.InputChanged:Connect(function(input)
   if not drag then return end
   local mouse = drag.input.UserInputType == Enum.UserInputType.MouseButton1
@@ -496,10 +764,15 @@ access.Visible = PREMIUM_EDITION and AUTO_KEY == ''
 
 local autoJoinBtn = D.make('TextButton', {Text='AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF'), Position=UDim2.new(0,10,1,-44),
   Size=UDim2.new(1,-20,0,34), BackgroundColor3=autoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50), TextColor3=Color3.new(1,1,1), TextSize=12}, panel)
+
+local function refreshAutoJoinButtons()
+  local onColor, offColor = Color3.fromRGB(40,160,85), Color3.fromRGB(160,50,50)
+  autoJoinBtn.Text = 'AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF')
+  autoJoinBtn.BackgroundColor3 = autoJoinEnabled and onColor or offColor
+end
 autoJoinBtn.Activated:Connect(function()
   autoJoinEnabled = not autoJoinEnabled
-  autoJoinBtn.Text = 'AUTO JOIN: '..(autoJoinEnabled and 'ON' or 'OFF')
-  autoJoinBtn.BackgroundColor3 = autoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50)
+  refreshAutoJoinButtons()
   saveSettings()
 end)
 
@@ -524,8 +797,7 @@ local function styleRaisedButton(button)
   if button:FindFirstChild('StuddedSurface') then return end
   local corner = button:FindFirstChildOfClass('UICorner'); if corner then corner.CornerRadius = UDim.new(0,3) end
   button.ClipsDescendants = true
-  local spec = mutationSprites.studs_v05
-  local texture = D.make('ImageLabel', {Name='StuddedSurface', Image=spec and spec.image or '',
+  local texture = D.make('ImageLabel', {Name='StuddedSurface', Image='',
     Size=UDim2.fromScale(1,1), BackgroundTransparency=1, ImageTransparency=0.65,
     ImageColor3=button.BackgroundColor3, ScaleType=Enum.ScaleType.Tile, TileSize=UDim2.fromOffset(256,256), Active=false, ZIndex=button.ZIndex}, button)
   local function tint() texture.ImageColor3 = button.BackgroundColor3 end
@@ -556,17 +828,28 @@ local function styleRaisedButton(button)
     end
   end
 end
-if mutationSprites.studs_v05 then
-  bar.BackgroundColor3 = Color3.fromRGB(46,47,52)
-  local headerGradient = bar:FindFirstChildOfClass('UIGradient')
-  if headerGradient then headerGradient.Color = ColorSequence.new(Color3.new(1,1,1), Color3.fromRGB(170,172,180)); headerGradient.Rotation = 90 end
-  D.make('ImageLabel', {Name='HeaderStuds', Image=mutationSprites.studs_v05.image, Size=UDim2.fromScale(1,1),
-    BackgroundTransparency=1, ScaleType=Enum.ScaleType.Tile, TileSize=UDim2.fromOffset(256,256),
-    ImageColor3=Color3.fromRGB(160,162,172), ImageTransparency=0.52, Active=false, ZIndex=bar.ZIndex}, bar)
-  wallpaper.Image = mutationSprites.studs_v05.image; wallpaper.ScaleType = Enum.ScaleType.Tile
-  wallpaper.TileSize = UDim2.fromOffset(256, 256); wallpaper.ImageColor3 = Color3.fromRGB(86,87,94); wallpaper.ImageTransparency = 0.12
-  wallpaperShade.BackgroundColor3 = Color3.fromRGB(15,16,20); wallpaperShade.BackgroundTransparency = 0.48
-end
+
+task.spawn(function()
+  local url = 'https://raw.githubusercontent.com/mallu837/JenicakesObsiUI/main/assets/background.png.txt'
+  local text
+  if type(game.HttpGet) == 'function' then
+    local ok, res = pcall(function() return game:HttpGet(url) end)
+    if ok and type(res) == 'string' and #res > 100 then text = res end
+  end
+  if type(text) ~= 'string' or text == '' then return end
+  local b64 = text:match('base64,(.+)') or text; b64 = b64:gsub('%s+', '')
+  if b64:sub(1,1) == '"' then b64 = b64:sub(2, -2) end
+  if type(base64decode) ~= 'function' or type(writefile) ~= 'function' or type(getcustomasset) ~= 'function' then return end
+  pcall(function()
+    writefile('jenicakes_bg.png', base64decode(b64))
+    local asset = getcustomasset('jenicakes_bg.png')
+    if type(asset) == 'string' and asset ~= '' and wallpaper.Parent then
+      wallpaper.Image = asset; wallpaper.ScaleType = Enum.ScaleType.Crop; wallpaper.TileSize = UDim2.fromOffset(0, 0)
+      wallpaper.ImageColor3 = Color3.new(1, 1, 1); wallpaper.ImageTransparency = 0.2
+      wallpaperShade.BackgroundColor3 = Color3.fromRGB(45, 20, 60); wallpaperShade.BackgroundTransparency = 0.5
+    end
+  end)
+end)
 
 for _, button in ipairs({scope, myScope, rarity, unlock, refreshButton, sizeMinus, sizePlus, autoJoinBtn}) do styleRaisedButton(button) end
 for _, button in ipairs({scope, myScope, rarity, unlock, autoJoinBtn}) do
@@ -585,11 +868,6 @@ themeModal = function(box)
   box.BackgroundColor3 = Color3.fromRGB(43,45,50); box.BackgroundTransparency = 0.03
   D.make('UIGradient', {Color=ColorSequence.new(Color3.new(1,1,1), Color3.fromRGB(165,168,178)), Rotation=90}, box)
   D.make('UIStroke', {Color=Color3.fromRGB(100,104,116), Thickness=2, ApplyStrokeMode=Enum.ApplyStrokeMode.Border}, box)
-  if mutationSprites.studs_v05 then
-    D.make('ImageLabel', {Name='ModalStuds', Image=mutationSprites.studs_v05.image, Size=UDim2.fromScale(1,1),
-      BackgroundTransparency=1, ScaleType=Enum.ScaleType.Tile, TileSize=UDim2.fromOffset(256,256),
-      ImageColor3=Color3.fromRGB(145,148,158), ImageTransparency=0.7, Active=false, ZIndex=box.ZIndex}, box)
-  end
 end
 syncCloseArt = function(button)
   button.BackgroundTransparency = 1; button.Font = Enum.Font.FredokaOne; button.TextSize = 30
@@ -621,16 +899,41 @@ loadUiAsset(gear, 'gear')
 local settingsOverlay = D.make('TextButton', {Name='SettingsOverlay', Text='', Visible=false,
   Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.32, AutoButtonColor=false, Active=true, ZIndex=50}, panel)
 local settingsBox = D.make('Frame', {Name='SettingsBox', AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
-  Size=UDim2.new(1,-28,0,360), BackgroundColor3=Color3.fromRGB(43,45,50), Active=true, ZIndex=51}, settingsOverlay)
+  Size=UDim2.new(1,-28,0,410), BackgroundColor3=Color3.fromRGB(43,45,50), Active=true, ZIndex=51}, settingsOverlay)
 D.make('UICorner', {CornerRadius=UDim.new(0,4)}, settingsBox)
 themeModal(settingsBox)
 
-local function settingsLabel(text, y)
-  local lbl = D.label(settingsBox, text, UDim2.fromOffset(14,y), UDim2.new(1,-28,0,28), Color3.new(1,1,1), 20)
+local function settingsLabel(text, y, xOffset, widthScale)
+  local lbl = D.label(settingsBox, text, UDim2.fromOffset(xOffset or 14, y),
+    UDim2.new(widthScale or 1, -28, 0, 28), Color3.new(1,1,1), 20)
   lbl.Font = Enum.Font.FredokaOne; lbl.TextXAlignment = Enum.TextXAlignment.Center; lbl.TextScaled = true; lbl.ZIndex = 54
   D.make('UITextSizeConstraint', {MinTextSize=12, MaxTextSize=20}, lbl); return lbl
 end
-settingsLabel('SETTINGS', 10); settingsLabel('CUSTOM GUI', 59); settingsLabel('CUSTOM HOTKEY MENU', 160)
+settingsLabel('SETTINGS', 10)
+settingsLabel('CUSTOM GUI', 59)
+
+local incomeHeader = D.label(settingsBox, 'MIN INCOME ($/S)', UDim2.fromOffset(14,160),
+  UDim2.new(0.60,-14,0,28), Color3.new(1,1,1), 18)
+incomeHeader.Font = Enum.Font.FredokaOne; incomeHeader.TextXAlignment = Enum.TextXAlignment.Left
+incomeHeader.TextScaled = true; incomeHeader.ZIndex = 54
+D.make('UITextSizeConstraint', {MinTextSize=12, MaxTextSize=18}, incomeHeader)
+
+local incomeToggle = D.make('TextButton', {Name='IncomeAutoToggle',
+  Text='AUTO: '..(incomeAutoJoinEnabled and 'ON' or 'OFF'),
+  Font=Enum.Font.FredokaOne, Position=UDim2.new(0.60,4,0,160),
+  Size=UDim2.new(0.40,-18,0,28),
+  BackgroundColor3=incomeAutoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50),
+  TextColor3=Color3.new(1,1,1), TextSize=15, ZIndex=55}, settingsBox)
+D.make('UICorner', {CornerRadius=UDim.new(0,5)}, incomeToggle)
+D.make('UIStroke', {Color=Color3.fromRGB(30,32,38), Thickness=2, ApplyStrokeMode=Enum.ApplyStrokeMode.Border}, incomeToggle)
+incomeToggle.Activated:Connect(function()
+  incomeAutoJoinEnabled = not incomeAutoJoinEnabled
+  incomeToggle.Text = 'AUTO: '..(incomeAutoJoinEnabled and 'ON' or 'OFF')
+  incomeToggle.BackgroundColor3 = incomeAutoJoinEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50)
+  saveSettings()
+end)
+
+settingsLabel('CUSTOM HOTKEY MENU', 250)
 
 sizeMinus.Parent = settingsBox; sizePlus.Parent = settingsBox; sizeLabel.Parent = settingsBox
 sizeMinus.Position = UDim2.new(0.5,-78,0,94); sizeMinus.Size = UDim2.fromOffset(48,48)
@@ -640,6 +943,66 @@ for _, obj in ipairs({sizeMinus, sizePlus, sizeLabel}) do
   obj.ZIndex = 55
   for _, child in ipairs(obj:GetDescendants()) do if child:IsA('GuiObject') then child.ZIndex = 56 end end
 end
+
+local function formatIncome(v)
+  if type(v) ~= 'number' or v ~= v or v <= 0 then return 'Any' end
+  for _, e in ipairs({{1e18,'Qi'},{1e15,'Qa'},{1e12,'T'},{1e9,'B'},{1e6,'M'},{1e3,'K'}}) do
+    if v >= e[1] then
+      local num = v/e[1]
+      local shown = (num == math.floor(num)) and string.format('%d', num) or string.format('%.2f', num):gsub('0+$',''):gsub('%.$','')
+      return '$'..shown..e[2]..'/s'
+    end
+  end
+  return '$'..string.format('%.0f', v)..'/s'
+end
+local function parseIncome(raw)
+  if type(raw) ~= 'string' then return nil end
+  local s = raw:gsub('[%s$,]', ''):lower():gsub('/s$', ''):gsub('persecond$', ''):gsub('persec$', '')
+  if s == '' or s == 'any' or s == '0' then return 0 end
+  local num, suffix = s:match('^(%d+%.?%d*)(%a*)$')
+  if not num then return nil end
+  local value = tonumber(num)
+  if not value or value ~= value or value < 0 then return nil end
+  local powers = {['']=1, k=1e3, m=1e6, b=1e9, t=1e12, qa=1e15, q=1e15, qi=1e18}
+  local factor = powers[suffix]
+  if not factor then return nil end
+  return value * factor
+end
+
+local incomeBox = D.make('TextBox', {Name='IncomeGate',
+  Text=(minIncome > 0) and formatIncome(minIncome) or 'Any',
+  PlaceholderText='Any (e.g. 2.5m)',
+  Position=UDim2.new(0,14,0,199), Size=UDim2.new(1,-28,0,42),
+  BackgroundColor3=(minIncome > 0) and Color3.fromRGB(40,140,90) or Color3.fromRGB(67,71,82),
+  TextColor3=Color3.new(1,1,1), Font=Enum.Font.FredokaOne, TextSize=18,
+  ClearTextOnFocus=true, TextXAlignment=Enum.TextXAlignment.Center, ZIndex=55}, settingsBox)
+D.make('UICorner', {CornerRadius=UDim.new(0,5)}, incomeBox)
+D.make('UIStroke', {Color=Color3.fromRGB(30,32,38), Thickness=2, ApplyStrokeMode=Enum.ApplyStrokeMode.Border}, incomeBox)
+
+local function commitIncome()
+  local parsed = parseIncome(incomeBox.Text)
+  if parsed == nil then
+    incomeBox.Text = (minIncome > 0) and formatIncome(minIncome) or 'Any'
+    incomeBox.BackgroundColor3 = (minIncome > 0) and Color3.fromRGB(40,140,90) or Color3.fromRGB(67,71,82)
+    return
+  end
+  minIncome = math.floor(parsed)
+  incomeBox.Text = (minIncome > 0) and formatIncome(minIncome) or 'Any'
+  incomeBox.BackgroundColor3 = (minIncome > 0) and Color3.fromRGB(40,140,90) or Color3.fromRGB(67,71,82)
+  saveSettings()
+end
+
+incomeBox.FocusLost:Connect(function(enterPressed)
+  commitIncome()
+  if enterPressed then incomeBox:ReleaseFocus() end
+end)
+
+incomeBox:GetPropertyChangedSignal('Text'):Connect(function()
+  if incomeBox:IsFocused() then
+    local parsed = parseIncome(incomeBox.Text)
+    incomeBox.BackgroundColor3 = (parsed and parsed > 0) and Color3.fromRGB(40,140,90) or Color3.fromRGB(67,71,82)
+  end
+end)
 
 local menuHotkey = Enum.KeyCode.F
 if type(settings.menuHotkey) == 'string' then
@@ -652,7 +1015,7 @@ if type(settings.menuHotkey) == 'string' then
 end
 
 local hotkeyButton = D.make('TextButton', {Name='HotkeyBind', Text=menuHotkey.Name, Font=Enum.Font.FredokaOne,
-  Position=UDim2.new(0,14,0,199), Size=UDim2.new(1,-28,0,42), BackgroundColor3=Color3.fromRGB(67,71,82),
+  Position=UDim2.new(0,14,0,289), Size=UDim2.new(1,-28,0,42), BackgroundColor3=Color3.fromRGB(67,71,82),
   TextColor3=Color3.new(1,1,1), TextSize=18, ZIndex=55}, settingsBox)
 local waitingForHotkey = false
 local function stopSettings() waitingForHotkey = false; settingsOverlay.Visible = false; hotkeyButton.Text = menuHotkey.Name end
@@ -661,68 +1024,6 @@ local settingsClose = D.make('TextButton', {Name='CloseSettings', Text='×', Pos
 syncCloseArt(settingsClose); settingsClose.Activated:Connect(stopSettings); settingsOverlay.Activated:Connect(stopSettings)
 settingsButton.Activated:Connect(function() if settingsOverlay.Visible then stopSettings() else settingsOverlay.Visible = true end end)
 hotkeyButton.Activated:Connect(function() waitingForHotkey = true; hotkeyButton.Text = 'PRESS A KEY  (ESC TO CANCEL)' end)
-
--- ═══════════════════ AUTO JOIN BY $/s VALUE (Settings UI) ═══════════════════
-settingsLabel('AUTO JOIN BY $/s VALUE', 250)
-
-local valueJoinInput = D.make('TextBox', {Name='AutoJoinValueInput', Text=D.money(autoJoinValueMin),
-  PlaceholderText='e.g. 1T or 1e12', Position=UDim2.new(0,14,0,285), Size=UDim2.new(0.58,-18,0,38),
-  ClearTextOnFocus=false, BackgroundColor3=Color3.fromRGB(222,225,232),
-  TextXAlignment=Enum.TextXAlignment.Center, ZIndex=55}, settingsBox)
-valueJoinInput.TextSize = 15
-
-local valueJoinToggle = D.make('TextButton', {Name='AutoJoinValueToggle', Text=autoJoinValueEnabled and 'ON' or 'OFF',
-  Position=UDim2.new(0.60,4,0,285), Size=UDim2.new(0.40,-18,0,38),
-  BackgroundColor3=autoJoinValueEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50),
-  TextColor3=Color3.new(1,1,1), TextSize=16, ZIndex=55}, settingsBox)
-valueJoinToggle.Font = Enum.Font.FredokaOne
-
-local valueJoinHint = D.label(settingsBox, 'Joins highest $/s egg at or above this value (ALL SERVERS)',
-  UDim2.fromOffset(14,327), UDim2.new(1,-28,0,16), Color3.fromRGB(200,210,230), 11)
-valueJoinHint.ZIndex = 54; valueJoinHint.TextScaled = true; valueJoinHint.TextXAlignment = Enum.TextXAlignment.Center
-D.make('UITextSizeConstraint', {MinTextSize=1, MaxTextSize=11}, valueJoinHint)
-
--- Commit helper — used by both TextChanged (debounced) and FocusLost.
-local valueCommitDebounce = nil
-local function commitValueJoinInput()
-  local parsed = parseRateValue(valueJoinInput.Text)
-  if parsed and parsed ~= autoJoinValueMin then
-    autoJoinValueMin = parsed
-    feedAt = -math.huge
-    saveSettings()
-  end
-  -- Reformat to canonical form so the user sees what was actually stored.
-  valueJoinInput.Text = D.money(autoJoinValueMin)
-end
-
-valueJoinToggle.Activated:Connect(function()
-  autoJoinValueEnabled = not autoJoinValueEnabled
-  valueJoinToggle.Text = autoJoinValueEnabled and 'ON' or 'OFF'
-  valueJoinToggle.BackgroundColor3 = autoJoinValueEnabled and Color3.fromRGB(40,160,85) or Color3.fromRGB(160,50,50)
-  feedAt = -math.huge
-  saveSettings()
-end)
-
-valueJoinInput:GetPropertyChangedSignal('Text'):Connect(function()
-  if valueCommitDebounce then task.cancel(valueCommitDebounce); valueCommitDebounce = nil end
-  valueCommitDebounce = task.delay(0.35, function()
-    valueCommitDebounce = nil
-    -- Don't re-write the box text while the user is still typing — only
-    -- parse/store silently. The visible reformat happens on FocusLost.
-    local parsed = parseRateValue(valueJoinInput.Text)
-    if parsed and parsed ~= autoJoinValueMin then
-      autoJoinValueMin = parsed
-      feedAt = -math.huge
-      saveSettings()
-    end
-  end)
-end)
-
-valueJoinInput.FocusLost:Connect(function()
-  if valueCommitDebounce then task.cancel(valueCommitDebounce); valueCommitDebounce = nil end
-  commitValueJoinInput()
-end)
-
 local hotkeyConnection = Input.InputBegan:Connect(function(input, processed)
   if input.UserInputType ~= Enum.UserInputType.Keyboard or input.KeyCode == Enum.KeyCode.Unknown then return end
   if waitingForHotkey then
@@ -771,9 +1072,6 @@ unlock.Activated:Connect(function() if not PREMIUM_EDITION then showPremiumPopup
 local mutationPalettes = {
   title = {Color3.fromRGB(223,221,221), Color3.fromRGB(255,255,255), Color3.fromRGB(214,214,214)},
   discord = {Color3.fromRGB(255,0,225), Color3.fromRGB(161,0,255)},
-  golden = {Color3.fromRGB(206,164,0), Color3.fromRGB(255,191,0), Color3.fromRGB(253,227,92)},
-  rainbow = {Color3.fromRGB(255,0,0), Color3.fromRGB(255,248,0), Color3.fromRGB(0,255,7)},
-  silver = {Color3.fromRGB(71,71,71), Color3.fromRGB(170,170,170), Color3.fromRGB(71,71,71)},
 }
 local filterPalettes = {
   cosmic = {Color3.fromRGB(67,37,239), Color3.fromRGB(113,29,255), Color3.fromRGB(41,12,217)},
@@ -786,7 +1084,7 @@ local rarityColors = {
   epic=Color3.fromRGB(255,110,200), rare=Color3.fromRGB(65,165,255), uncommon=Color3.fromRGB(105,220,120),
   common=Color3.fromRGB(220,225,235),
 }
-local mutationGradients = {golden={}, silver={}, rainbow={}, discord={}, title={}}
+local mutationGradients = {discord={}, title={}}
 local rarityGradientBuckets = {cosmic={}, secret={}, eternal={}}
 local function mutationSequence(palette, now)
   local phase = (now/4) % 1
@@ -988,8 +1286,6 @@ local function mutationNames(entry)
   return result
 end
 local function mutationWidth(name, textService, available)
-  local spec = mutationSpriteData[name:lower()]
-  if spec then return math.min(available, math.ceil(spec.width/spec.height*24)+8) end
   return math.min(available, math.ceil(textService:GetTextSize(name,22,Enum.Font.Arcade,Vector2.new(1000,28)).X)+8)
 end
 local function mutationWord(row, name, position, width)
@@ -999,30 +1295,7 @@ local function mutationWord(row, name, position, width)
   D.make('UITextSizeConstraint', {MinTextSize=1, MaxTextSize=22}, word)
   mutationStyle(word, name)
   word.TextStrokeColor3 = Color3.new(0,0,0); word.TextStrokeTransparency = 0
-  local fallbackStroke = D.make('UIStroke', {Color=Color3.new(0,0,0), Thickness=1.1}, word)
-  local spec = mutationSprites[name:lower()]
-  if spec then
-    local glyph = D.make('ImageLabel', {Image=spec.image, ImageTransparency=1, BackgroundTransparency=1,
-      ImageColor3=Color3.new(1,1,1), Size=UDim2.new(1,-4,1,-4), Position=UDim2.fromOffset(2,2),
-      ScaleType=Enum.ScaleType.Fit, Active=false, ZIndex=word.ZIndex+2}, word)
-    pcall(function() glyph.ResampleMode = Enum.ResamplerMode.Pixelated end)
-    local shadows = {}
-    for _, offset in ipairs({{-1,0},{1,0},{0,-1},{0,1}}) do
-      local shadow = D.make('ImageLabel', {Image=spec.image, ImageTransparency=1, ImageColor3=Color3.new(0,0,0),
-        BackgroundTransparency=1, Size=UDim2.new(1,-4,1,-4), Position=UDim2.fromOffset(2+offset[1], 2+offset[2]),
-        ScaleType=Enum.ScaleType.Fit, Active=false, ZIndex=word.ZIndex+1}, word)
-      pcall(function() shadow.ResampleMode = Enum.ResamplerMode.Pixelated end)
-      shadows[#shadows+1] = shadow
-    end
-    mutationStyle(glyph, name)
-    local function ready()
-      if glyph.IsLoaded then
-        fallbackStroke.Enabled = false; word.TextStrokeTransparency = 1; word.TextTransparency = 1; glyph.ImageTransparency = 0
-        for _, shadow in ipairs(shadows) do shadow.ImageTransparency = 0 end
-      end
-    end
-    glyph:GetPropertyChangedSignal('IsLoaded'):Connect(ready); ready()
-  end
+  D.make('UIStroke', {Color=Color3.new(0,0,0), Thickness=1.1}, word)
   return word
 end
 local function updateCard(card, entry, i)
@@ -1073,19 +1346,20 @@ local function updateCard(card, entry, i)
   end
 end
 
-local function network(url, method, body, hdrs, raw)
+local function network(url, method, body, hdrs, raw, timeout)
   if type(requestFn) ~= 'function' then return nil, 'Executor HTTP unavailable' end
-  local waitDeadline = os.clock() + 15
-  while networkBusy and os.clock() < waitDeadline and active do task.wait(0.05) end
+  timeout = timeout or 6
+  local waitDeadline = os.clock() + 1.5
+  while networkBusy and os.clock() < waitDeadline and active do task.wait(0.02) end
   if networkBusy then return nil, 'Network busy' end
   networkBusy = true
   local done, result = false, nil
   task.spawn(function()
-    result = table.pack(pcall(requestFn, {Url=url, Method=method, Headers=hdrs or {}, Body=body, Timeout=10}))
+    result = table.pack(pcall(requestFn, {Url=url, Method=method, Headers=hdrs or {}, Body=body, Timeout=timeout}))
     done = true; networkBusy = false
   end)
-  local deadline = os.clock() + 12
-  while active and not done and os.clock() < deadline do task.wait(0.1) end
+  local deadline = os.clock() + timeout + 1
+  while active and not done and os.clock() < deadline do task.wait(0.03) end
   if not done then return nil, 'Network timeout' end
   if not result[1] then return nil, 'Network failed' end
   local response = result[2]
@@ -1104,7 +1378,7 @@ local function network(url, method, body, hdrs, raw)
 end
 
 local function loadConfig()
-  local data, err = network('https://raw.githubusercontent.com/syss1211/Tenshi-script/main/NYX-Finder-Config.json?nyx='..os.time(), 'GET')
+  local data, err = network('https://raw.githubusercontent.com/syss1211/Tenshi-script/main/NYX-Finder-Config.json?nyx='..os.time(), 'GET', nil, nil, false, 6)
   if not data then return false, err end
   if type(data.endpoint) ~= 'string' or not data.endpoint:match('^https://[%w%.%-]+$') or type(data.roomKey) ~= 'string' then
     return false, 'Invalid config'
@@ -1141,7 +1415,7 @@ local function report()
   if game.JobId == '' then return false, 'No live server ID' end
   if not config then return false, 'No config' end
   local body = {placeId=game.PlaceId, jobId=game.JobId, reporterId=reporterId, eggs=snapshot()}
-  local data, err = network(config.endpoint..'/v1/report', 'POST', Http:JSONEncode(body), headers())
+  local data, err = network(config.endpoint..'/v1/report', 'POST', Http:JSONEncode(body), headers(), false, 6)
   if data and data.ok == true then return true, 'Shared '..tostring(data.accepted)..' eggs' end
   return false, err or 'Report failed'
 end
@@ -1151,7 +1425,7 @@ local function refresh()
   if not config then return false, 'No config' end
   local query = '?placeId='..game.PlaceId..'&limit=50&tier=public&offset=0&minRate='..tostring(minRate)..'&minRank='..tostring(minRank)
   if othersOnly then query = query..'&onlyJob='..Http:UrlEncode(game.JobId) end
-  local data, err = network(config.endpoint..'/v1/eggs'..query, 'GET', nil, headers())
+  local data, err = network(config.endpoint..'/v1/eggs'..query, 'GET', nil, headers(), false, 5)
   if epoch ~= queryEpoch then return true end
   if not data or type(data.items) ~= 'table' then return false, err or 'Invalid feed' end
   clockOffset = (tonumber(data.serverTime) or os.time()*1000)/1000 - os.clock()
@@ -1161,138 +1435,200 @@ local function refresh()
   return true
 end
 
-local function executeJoin(entry, card)
-  if joining or not entry or entry.jobId == game.JobId then return end
-  local placeId = tonumber(entry.placeId)
-  local jobId = entry.jobId
-  if not placeId or type(jobId) ~= 'string' or jobId == '' then return end
-  if (os.clock() + clockOffset) * 1000 >= (entry.expiresAt or 0) then return end
-
-  joining = true
-  joiningKey = entry.key
-  if card then updateCard(card, entry, card.row.LayoutOrder or 1) end
-
-  task.spawn(function()
-    local ok, err = pcall(function()
-      if not config then loadConfig() end
-      if config and config.endpoint then
-        local claim, claimErr = network(config.endpoint..'/v1/join', 'POST',
-          Http:JSONEncode({placeId=placeId, jobId=jobId, uid=entry.uid, reporterId=reporterId, userId=D.player.UserId}),
-          headers()
-        )
-        if claim and claim.allowed ~= true and (claim.unavailable or claim.full) then
-          entry.full = true
-          entry.unavailable = claim.unavailable == true
-          entry.takenConfirmed = claim.takenConfirmed == true
-          if card then pcall(function() updateCard(card, entry, card.row.LayoutOrder or 1) end) end
-          error('Egg no longer available')
-        end
-      end
-      if config then pcall(report) end
-      print('[Jen Join] Teleporting to', placeId, jobId)
-      Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
-    end)
-    if not ok then
-      joining = false; joiningKey = nil
-      lastJoinErrorMsg = 'Join failed: '..tostring(err)
-      lastJoinErrorAt = os.clock()
-      if card then pcall(function() updateCard(card, entry, card.row.LayoutOrder or 1) end) end
-    end
-  end)
-
-  -- Fast unlock. TeleportInitFailed fires in <1s on a bad job; a successful
-  -- teleport unloads this script entirely; the only case this covers is a
-  -- stuck/blocked claim. 2s gives ~2x the churn of the old 4s fallback.
-  task.delay(2, function()
-    if joining and joiningKey == entry.key then
-      joining = false; joiningKey = nil
-    end
-  end)
+local function isBlocked(jobId)
+  local t = blockedServers[jobId]
+  if not t then return false end
+  if os.clock() - t > BLOCK_TTL then blockedServers[jobId] = nil; return false end
+  return true
 end
 
-local function maybeAutoJoinByValue()
-  if not autoJoinValueEnabled or joining or othersOnly then return end
-  if os.clock() - lastValueJoinAt < 1 then return end   -- was 10s; now a 1s debounce only
-  local now = (os.clock() + clockOffset) * 1000
-  -- Collect *every* viable candidate, skipping jobs we tried very recently,
-  -- then sort highest $/s first so we always advance to the fastest one.
-  local candidates = {}
-  for _, e in ipairs(feed) do
-    if type(e.rate) == 'number' and e.rate >= autoJoinValueMin
-      and type(e.jobId) == 'string' and e.jobId ~= '' and e.jobId ~= game.JobId
-      and e.placeId and (e.expiresAt or 0) > now then
-      local last = valueJoinAttempts[e.jobId]
-      if not last or os.clock() - last >= 20 then   -- was 45s; 20s is still enough to dodge retry spam
-        candidates[#candidates+1] = e
+local function markBlocked(jobId, reason)
+  if type(jobId) ~= 'string' then return end
+  blockedServers[jobId] = os.clock()
+  print('[Jen Auto-Join] blocked', jobId, reason)
+end
+
+local function isRecentlyAttempted(jobId)
+  local t = recentlyAttempted[jobId]
+  if not t then return false end
+  if os.clock() - t > ATTEMPT_TTL then recentlyAttempted[jobId] = nil; return false end
+  return true
+end
+local function markAttempted(jobId)
+  if type(jobId) == 'string' and jobId ~= '' then recentlyAttempted[jobId] = os.clock() end
+end
+
+local function isFullErr(msg)
+  if type(msg) ~= 'string' then return false end
+  local m = msg:lower()
+  return m:find('full', 1, true) ~= nil
+      or m:find('no available', 1, true) ~= nil
+      or m:find('queue', 1, true) ~= nil
+      or m:find('maximum', 1, true) ~= nil
+end
+
+local function isBlockedErr(msg)
+  if type(msg) ~= 'string' then return false end
+  local m = msg:lower()
+  return m:find('restricted', 1, true) ~= nil
+      or m:find('not allowed', 1, true) ~= nil
+      or m:find('blocked', 1, true) ~= nil
+      or m:find('private', 1, true) ~= nil
+      or m:find('access denied', 1, true) ~= nil
+      or m:find('kicked', 1, true) ~= nil
+      or m:find('banned', 1, true) ~= nil
+end
+
+local function passesIncomeGate(entry)
+  if minIncome <= 0 then return true end
+  local rate = tonumber(entry.rate)
+  return type(rate) == 'number' and rate >= minIncome
+end
+
+local function passesMainGate(entry)
+  local rank = tonumber(entry.rank or entry.tier)
+  if type(rank) == 'number' and rank < minRank then return false end
+  if entry.full or entry.unavailable or entry.takenConfirmed then return false end
+  if isBlocked(entry.jobId) then return false end
+  return true
+end
+
+local function executeJoinWithFallback(chain, startIdx)
+  if joining or type(chain) ~= 'table' or #chain == 0 then return end
+  local idx = startIdx or 1
+  local tried = {}
+
+  local function fireOne(entry)
+    if not entry or entry.jobId == game.JobId or not entry.placeId then return false end
+    if isBlocked(entry.jobId) or entry.full or entry.unavailable then return false end
+    local placeId = tonumber(entry.placeId)
+    local jobId = entry.jobId
+    if not placeId or type(jobId) ~= 'string' or jobId == '' then return false end
+    if (os.clock() + clockOffset) * 1000 >= (entry.expiresAt or 0) then return false end
+
+    local card = cardsByKey[entry.key]
+    joining = true; joiningKey = entry.key
+    if card then pcall(updateCard, card, entry, card.row.LayoutOrder or 1) end
+
+    local ok, err = pcall(function()
+      Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
+    end)
+
+    if ok then
+      entry.verifiedAt = os.clock()
+      notifOnJoin(entry)
+      if config and config.endpoint then
+        task.spawn(function()
+          local claim = network(config.endpoint..'/v1/join', 'POST',
+            Http:JSONEncode({placeId=placeId, jobId=jobId, uid=entry.uid,
+              reporterId=reporterId, userId=D.player.UserId}), headers(), false, 2.5)
+          if claim and claim.allowed ~= true then
+            entry.full = claim.full == true
+            entry.unavailable = claim.unavailable == true
+            entry.takenConfirmed = claim.takenConfirmed == true
+            local c = cardsByKey[entry.key]
+            if c then pcall(updateCard, c, entry, c.row.LayoutOrder or 1) end
+          end
+        end)
       end
+      if config then task.spawn(function() pcall(report) end) end
+    else
+      local msg = tostring(err)
+      joining = false; joiningKey = nil
+      lastJoinErrorMsg = 'Join failed: '..msg; lastJoinErrorAt = os.clock()
+      if isBlockedErr(msg) then markBlocked(jobId, msg)
+      elseif isFullErr(msg) then entry.full = true end
+      if card then pcall(updateCard, card, entry, card.row.LayoutOrder or 1) end
+      return false
+    end
+
+    local waitStart = os.clock()
+    while joining and active and os.clock() - waitStart < 0.4 do task.wait(0.02) end
+    if joining then joining = false; joiningKey = nil end
+    return true
+  end
+
+  while active and idx <= #chain do
+    local entry = chain[idx]; idx = idx + 1
+    if entry and not tried[entry.key] then
+      tried[entry.key] = true
+      if fireOne(entry) then break end
     end
   end
-  if #candidates == 0 then return end
-  table.sort(candidates, function(a, b) return a.rate > b.rate end)
-  local best = candidates[1]
-  valueJoinAttempts[best.jobId] = os.clock()
-  lastValueJoinAt = os.clock()
-  for jobId, t in pairs(valueJoinAttempts) do
-    if os.clock() - t > 300 then valueJoinAttempts[jobId] = nil end
-  end
-  print(string.format('[Jen Auto-Join Value] %s @ %s', tostring(best.name), D.money(best.rate)))
-  executeJoin(best, cardsByKey[best.key])
+
+  task.delay(20, function() if joining then joining = false; joiningKey = nil end end)
 end
 
 local function startSpamJoin()
-  -- FIX: when the value-based auto-join is ON, never run the reset fallback.
-  if autoJoinValueEnabled then
-    print('[Jen Auto-Join] Skipped: AUTO JOIN BY $/s VALUE is enabled.')
-    return
+  print('[Jen Auto-Join] Triggered.')
+
+  if not config or os.clock() - configAt > 60 then
+    local ok, err = loadConfig()
+    if not ok then
+      queryStatus = 'Auto-join: config unavailable ('..tostring(err)..')'
+      print('[Jen Auto-Join] config load failed:', err)
+      return
+    end
   end
-  print('[Jen Auto-Join] Triggered. Refreshing feed...')
-  pcall(function()
-    if config then refresh() end
-  end)
-  render()
+
+  task.spawn(function() pcall(refresh) end)
 
   local waitStart = os.clock()
-  while active and (#currentTopEntries == 0 or currentTopEntries[1].jobId == game.JobId) do
+  local function haveRemote()
+    for _, e in ipairs(currentTopEntries) do
+      if e and e.jobId and e.jobId ~= game.JobId and passesMainGate(e) then return true end
+    end
+    for _, e in ipairs(feed) do
+      if e and e.jobId and e.jobId ~= game.JobId and passesMainGate(e) then return true end
+    end
+    return false
+  end
+
+  while active and not haveRemote() do
     if os.clock() - waitStart > 10 then
+      queryStatus = 'Auto-join: no remote target in feed'
       print('[Jen Auto-Join] Timed out waiting for remote targets.')
       return
     end
-    task.wait(0.5)
+    pcall(function() if config and os.clock() - feedAt > 2 then refresh() end end)
+    task.wait(0.15)
   end
 
-  local startTime = os.clock()
-  -- 15s window so we can cycle through the top 5 servers.
-  local DURATION = 15
-  local clickIndex = 1
-  local attempts = 0
-
+  local startTime = os.clock(); local DURATION = 10; local attempts = 0
   task.spawn(function()
     while active and (os.clock() - startTime) < DURATION do
-      local maxEntries = math.min(5, #currentTopEntries)   -- was 3; walk the full top-5
-      if maxEntries == 0 then
-        task.wait(0.2)
+      local chain = {}
+      for i = 1, math.min(5, #currentTopEntries) do
+        local e = currentTopEntries[i]
+        if e and e.jobId ~= game.JobId and e.placeId and passesMainGate(e) then
+          chain[#chain + 1] = e
+        end
+      end
+      if #chain == 0 then
+        for _, e in ipairs(feed) do
+          if e and e.jobId and e.jobId ~= game.JobId and e.placeId and passesMainGate(e) then
+            chain[#chain + 1] = e
+            if #chain >= 5 then break end
+          end
+        end
+      end
+      if #chain == 0 then
+        task.wait(0.15)
       else
         local joinStart = os.clock()
-        while joining and active and (os.clock() - joinStart) < 3
-              and (os.clock() - startTime) < DURATION do
-          task.wait(0.1)
-        end
-
+        while joining and active and (os.clock() - joinStart) < 1.5
+              and (os.clock() - startTime) < DURATION do task.wait(0.08) end
         if not active or (os.clock() - startTime) >= DURATION then break end
-
-        if clickIndex > maxEntries then clickIndex = 1 end
-        local target = currentTopEntries[clickIndex]
-        if target and target.jobId ~= game.JobId and target.placeId then
-          print(string.format('[Jen Auto-Join] #%d %s @ %s', clickIndex, tostring(target.name), D.money(target.rate or 0)))
-          executeJoin(target, cardsByKey[target.key])
-          attempts = attempts + 1
-        end
-        clickIndex = clickIndex + 1
-        if clickIndex > maxEntries then clickIndex = 1 end
-        task.wait(0.4)   -- was 0.8; roughly 2x more attempts per second window
+        local target = chain[1]
+        print('[Jen Auto-Join] attempting:', tostring(target.name), '| income:', tostring(target.rate))
+        attempts = attempts + 1
+        executeJoinWithFallback(chain, 1)
+        local settle = os.clock()
+        while joining and active and (os.clock() - settle) < 2.5
+              and (os.clock() - startTime) < DURATION do task.wait(0.1) end
       end
     end
-    print('[Jen Auto-Join] 15s window ended. Attempts: '..attempts)
+    print('[Jen Auto-Join] 10s window ended. Attempts: '..attempts)
   end)
 end
 
@@ -1300,7 +1636,7 @@ local function renderOnce()
   local passEpoch = queryEpoch
   local batchStarted = os.clock()
   local function checkpoint()
-    if os.clock() - batchStarted < 0.003 then return true end
+    if os.clock() - batchStarted < 0.008 then return true end
     task.wait(); batchStarted = os.clock()
     if not active then return false end
     if queryEpoch ~= passEpoch then renderPending = true; return false end
@@ -1340,6 +1676,19 @@ local function renderOnce()
     end
   end
 
+  do
+    local filtered = {}
+    for _, e in ipairs(source) do
+      local here = e.isLocal or e.jobId == game.JobId
+      if not (e.full or e.unavailable or e.takenConfirmed) then
+        filtered[#filtered + 1] = e
+      elseif here and othersOnly then
+        filtered[#filtered + 1] = e
+      end
+    end
+    source = filtered
+  end
+
   table.sort(source, function(a, b)
     local ra, rb = a.rate or 0, b.rate or 0
     if ra ~= rb then return ra > rb end
@@ -1350,9 +1699,9 @@ local function renderOnce()
   for i, e in ipairs(source) do e.displayRank = i end
 
   currentTopEntries = {}
-  for i = 1, math.min(5, #source) do
-    currentTopEntries[i] = source[i]
-  end
+  for i = 1, math.min(5, #source) do currentTopEntries[i] = source[i] end
+
+  if #source > 0 and not list.Visible then list.Visible = true end
 
   local savedScroll = list.CanvasPosition
   local canvasHeight = #source == 0 and 40 or 0
@@ -1386,21 +1735,9 @@ local function renderOnce()
       D.make('Frame', {Name='CardBevelBottom', Position=UDim2.new(0,2,1,-2), Size=UDim2.new(1,-4,0,1),
         BackgroundColor3=Color3.fromRGB(24,25,28), BorderSizePixel=0, Active=false}, row)
       local spotlight = D.make('Frame', {Name='PetSpotlight', Position=UDim2.fromOffset(2,0), Size=UDim2.new(0,82,1,-22),
-        BackgroundTransparency=1, BorderSizePixel=0, ClipsDescendants=false, Active=false, ZIndex=row.ZIndex+1}, row)
-      for n = 0, 11 do
-        local ray = D.make('Frame', {Name='WhiteRay', AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
-          Size=UDim2.new(0.94,0,0,n%2==0 and 8 or 4), Rotation=n*15+8, BackgroundColor3=Color3.new(1,1,1),
-          BackgroundTransparency=0.66, BorderSizePixel=0, Active=false, ZIndex=spotlight.ZIndex}, spotlight)
-        D.make('UIGradient', {Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1), NumberSequenceKeypoint.new(0.2,0.97),
-          NumberSequenceKeypoint.new(0.4,0.65), NumberSequenceKeypoint.new(0.5,0.2), NumberSequenceKeypoint.new(0.6,0.65),
-          NumberSequenceKeypoint.new(0.8,0.97), NumberSequenceKeypoint.new(1,1)}), Rotation=0}, ray)
-      end
-      for n = 1, 12 do
-        local glow = D.make('Frame', {Name='SoftCenter', AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
-          Size=UDim2.fromScale(1-n*0.065, 1-n*0.065), BackgroundColor3=Color3.new(1,1,1),
-          BackgroundTransparency=0.985-n*0.002, BorderSizePixel=0, Active=false, ZIndex=spotlight.ZIndex}, spotlight)
-        D.make('UICorner', {CornerRadius=UDim.new(1,0)}, glow)
-      end
+        BackgroundTransparency=0.85, BackgroundColor3=Color3.fromRGB(180,180,200),
+        BorderSizePixel=0, ClipsDescendants=false, Active=false, ZIndex=row.ZIndex+1}, row)
+      D.make('UICorner', {CornerRadius=UDim.new(1,0)}, spotlight)
       card.spotlight = spotlight
       card.icon = D.make('ImageLabel', {Name='PetIcon', Image=entry.icon or '', ZIndex=spotlight.ZIndex+1,
         BackgroundTransparency=1, Size=UDim2.fromOffset(88,88), Position=UDim2.fromOffset(4,4), ScaleType=Enum.ScaleType.Fit}, row)
@@ -1510,9 +1847,51 @@ local function renderOnce()
       join.Active = not (entry.full or entry.unavailable)
       join.AutoButtonColor = not (entry.full or entry.unavailable)
       join.Selectable = not (entry.full or entry.unavailable)
-
       join.Activated:Connect(function()
-        executeJoin(card.entry, card)
+        if joining then return end
+        local e = card.entry
+        if not e or e.isLocal or e.jobId == game.JobId then return end
+        if e.full or e.unavailable or e.takenConfirmed then return end
+        if isBlocked(e.jobId) then return end
+        local placeId = tonumber(e.placeId)
+        local jobId = e.jobId
+        if not placeId or type(jobId) ~= 'string' or jobId == '' then return end
+        if (os.clock() + clockOffset) * 1000 >= (e.expiresAt or 0) then return end
+
+        joining = true; joiningKey = e.key
+        pcall(updateCard, card, e, card.row.LayoutOrder or 1)
+
+        local ok, err = pcall(function()
+          Teleports:TeleportToPlaceInstance(placeId, jobId, D.player)
+        end)
+
+        if ok then
+          e.verifiedAt = os.clock()
+          notifOnJoin(e)
+          if config and config.endpoint then
+            task.spawn(function()
+              local claim = network(config.endpoint..'/v1/join', 'POST',
+                Http:JSONEncode({placeId=placeId, jobId=jobId, uid=e.uid,
+                  reporterId=reporterId, userId=D.player.UserId}), headers(), false, 2.5)
+              if claim and claim.allowed ~= true then
+                e.full = claim.full == true
+                e.unavailable = claim.unavailable == true
+                e.takenConfirmed = claim.takenConfirmed == true
+                local c = cardsByKey[e.key]
+                if c then pcall(updateCard, c, e, c.row.LayoutOrder or 1) end
+              end
+            end)
+          end
+          if config then task.spawn(function() pcall(report) end) end
+          task.delay(1.5, function() if joining and joiningKey == e.key then joining = false; joiningKey = nil end end)
+        else
+          local msg = tostring(err)
+          joining = false; joiningKey = nil
+          lastJoinErrorMsg = 'Join failed: '..msg; lastJoinErrorAt = os.clock()
+          if isBlockedErr(msg) then markBlocked(jobId, msg)
+          elseif isFullErr(msg) then e.full = true end
+          pcall(updateCard, card, e, card.row.LayoutOrder or 1)
+        end
       end)
     end
     card.entry = entry
@@ -1558,7 +1937,6 @@ refreshButton.Activated:Connect(function()
         if not loaded then error(message) end
       end
       render()
-      if autoJoinValueEnabled then pcall(maybeAutoJoinByValue) end
     end)
     refreshing = false
     if active then
@@ -1568,13 +1946,30 @@ refreshButton.Activated:Connect(function()
   end)
 end)
 
-Teleports.TeleportInitFailed:Connect(function(who, _, message)
-  if who == D.player then
-    joining = false; joiningKey = nil
-    lastJoinErrorMsg = 'Teleport failed: '..tostring(message)
-    lastJoinErrorAt = os.clock()
-    queryStatus = lastJoinErrorMsg
-    print('[Jen Join] TeleportInitFailed:', tostring(message))
+Teleports.TeleportInitFailed:Connect(function(who, result, message)
+  if who ~= D.player then return end
+  joining = false
+  local key = joiningKey; joiningKey = nil
+  local msg = tostring(message or '')
+  local isFull = (result == Enum.TeleportResult.GameFull or result == Enum.TeleportResult.GamePrivate)
+  if isFull or isFullErr(msg) then
+    for _, e in ipairs(currentTopEntries) do
+      if e.key == key then e.full = true; break end
+    end
+    lastJoinErrorMsg = 'Target full — trying next'
+    lastJoinErrorAt = os.clock(); queryStatus = lastJoinErrorMsg
+    print('[Jen Auto-Join] full/private:', key, result, msg)
+  elseif isBlockedErr(msg) then
+    for _, e in ipairs(currentTopEntries) do
+      if e.key == key then markBlocked(e.jobId, msg); break end
+    end
+    lastJoinErrorMsg = 'Server blocked — skipping'
+    lastJoinErrorAt = os.clock(); queryStatus = lastJoinErrorMsg
+    print('[Jen Auto-Join] blocked:', key, msg)
+  else
+    lastJoinErrorMsg = 'Teleport failed: '..msg
+    lastJoinErrorAt = os.clock(); queryStatus = lastJoinErrorMsg
+    print('[Jen Join] TeleportInitFailed:', msg)
   end
 end)
 
@@ -1589,24 +1984,50 @@ task.spawn(function()
         local success, message = loadConfig()
         if not success then error(message) end
       end
-      local reportInterval = autoJoinValueEnabled and 10 or 20
-      if os.clock() - lastReport >= reportInterval then
+      if os.clock() - lastReport >= 20 then
         lastReport = os.clock()
         local success, message = report()
         reportStatus = success and message or 'Share: '..tostring(message)
       end
-      local refreshInterval = autoJoinValueEnabled and 3 or 8
+      local refreshInterval = incomeAutoJoinEnabled and 2.5 or 8
       if not othersOnly and os.clock() - feedAt >= refreshInterval then
         local success, message = refresh()
-        if not success then queryStatus = 'Finder: '..tostring(message) end
-        -- Fire *immediately* after the feed updates so a fresh high-$/s egg
-        -- triggers a join on the same tick instead of waiting for the next poll.
-        if autoJoinValueEnabled then pcall(maybeAutoJoinByValue) end
+        if not success then queryStatus = 'Finder: '..tostring(message)
+        else fastScanSignal = true end
       end
-      maybeAutoJoinByValue()
     end)
     if not ok then queryStatus = tostring(err) end
-    task.wait(autoJoinValueEnabled and 0.5 or 2)
+    task.wait(0.5)
+  end
+end)
+
+task.spawn(function()
+  while active do
+    if incomeAutoJoinEnabled and not othersOnly and not joining then
+      local now = (os.clock() + clockOffset) * 1000
+      local best
+      for _, e in ipairs(feed) do
+        if e.jobId ~= game.JobId
+           and type(e.expiresAt) == 'number' and e.expiresAt > now
+           and (e.rank or 0) >= minRank
+           and passesIncomeGate(e)
+           and not e.full and not e.unavailable and not e.takenConfirmed
+           and not isBlocked(e.jobId)
+           and not isRecentlyAttempted(e.jobId) then
+          if not best or (e.rate or 0) > (best.rate or 0) then best = e end
+        end
+      end
+      if best then
+        markAttempted(best.jobId)
+        executeJoinWithFallback({best}, 1)
+      end
+    end
+    if fastScanSignal then
+      fastScanSignal = false
+      task.wait()
+    else
+      task.wait(0.1)
+    end
   end
 end)
 
@@ -1919,12 +2340,12 @@ local function run()
                 scale = scale, weight = weight, rate = rate, estimated = false, traitsKnown = traitsKnown,
               })
               eggs[#eggs].unresolved = spec.DisplayName == nil or spec.Rarity == nil
-              if not traitsKnown then eggs[#eggs].unmutatedRate = computedRate(spec.EarningRate, scale, {}, mutations) end
+              if not traitsKnown then eggs[#eggs].unresolvedRate = computedRate(spec.EarningRate, scale, {}, mutations) end
             end
           end
         end
       end
-      for _, entry in ipairs(eggs) do entry.rate = entry.rate or entry.unmutatedRate end
+      for _, entry in ipairs(eggs) do entry.rate = entry.rate or entry.unmutatedRate or entry.unresolvedRate end
       for _, entry in ipairs(eggs) do entry.mutationText = tostring(entry.area or ''):match('Mut:%s*(.*)') or '' end
       latestEntries = eggs
     end)
@@ -1940,33 +2361,47 @@ end)
 
 fitFinder()
 panel.Visible = true
+panelShownAt = os.clock()
+task.spawn(prewarmOnOpen)
 render()
 
 task.spawn(function()
-  local lastReset = nil
+  local cycle0 = cycleInfo()
+  local lastReset = cycle0 and cycle0.resetAt or nil
+  local cycleMissingLogged = false
   while active do
     local cycle = cycleInfo()
     if cycle then
       if lastReset == nil then
         lastReset = cycle.resetAt
+        print('[Jen Auto-Join] reset watcher armed | resetAt=', tostring(cycle.resetAt))
       elseif lastReset ~= cycle.resetAt then
         lastReset = cycle.resetAt
         feedAt = -math.huge
         print('[Jen Auto-Join] Reset detected! Waiting 5 seconds...')
         task.spawn(function()
           task.wait(5)
-          if active and autoJoinEnabled then
-            startSpamJoin()
+          if not active then return end
+          if not autoJoinEnabled then
+            queryStatus = 'Auto-join: toggle is OFF'
+            print('[Jen Auto-Join] skipped — autoJoinEnabled=false')
+            return
           end
+          queryStatus = 'Auto-join: firing on reset'
+          pcall(startSpamJoin)
         end)
       end
-
       local seconds = math.max(0, math.ceil(cycle.remaining))
       resetTimer.Text = cycle.running and string.format('RESET %02d:%02d', math.floor(seconds/60), seconds%60) or 'RESET PAUSED'
       resetTimer.TextColor3 = cycle.running and seconds <= 60 and Color3.fromRGB(255,85,85)
         or cycle.running and seconds <= 150 and Color3.fromRGB(255,215,65) or Color3.fromRGB(230,245,255)
     else
       resetTimer.Text = 'RESET --:--'; resetTimer.TextColor3 = Color3.fromRGB(230,245,255)
+      if not cycleMissingLogged then
+        cycleMissingLogged = true
+        print('[Jen Auto-Join] cycleInfo() is nil — AreaEggCycle module not resolvable. Reset watcher cannot fire.')
+        queryStatus = 'Auto-join: cycle module unavailable'
+      end
     end
     if joining then
       status.Text = 'Joining server…'
@@ -1978,6 +2413,6 @@ task.spawn(function()
     updateSpawnAges(cycle)
     local ok = pcall(render)
     if not ok then queryStatus = 'Unable to display finder feed' end
-    task.wait(1)
+    task.wait((#feed < 3 or #currentTopEntries < 3) and 0.25 or 1)
   end
 end)
